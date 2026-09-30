@@ -937,7 +937,7 @@ def cmd_block(args: argparse.Namespace) -> int:
             if not purged:
                 log("  [!] API note: Service Account currently authorized for readonly + settings.basic.")
                 log("      To enable retroactive API trashing for Workspace, authorize 'https://mail.google.com/'")
-                log("      for Client ID 115429729986898493672 in Google Admin Console.")
+                log("      for your own service account client ID in Google Admin Console.")
 
         # Post-purge re-read verification (AGENTS.md compliance)
         remaining = search_mailbox(token, target.search_query, limit=10)

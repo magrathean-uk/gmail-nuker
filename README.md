@@ -45,6 +45,22 @@ cd ..
 
 Launch from the repository root so the app can find `bin/gmail-block`, and provide the configuration variables in its environment. The GUI uses Homebrew Python when available. The compiled app bundle is excluded from source control.
 
+## Behavior to review
+
+Committed blocks may automatically contact unsubscribe endpoints or send unsubscribe email. API purge moves messages to Trash; IMAP fallback issues Deleted/expunge operations. Scans fetch one page, default 50 and at most 500 IDs, rather than every historical message. Review [limitations](docs/limitations.md) before changing a mailbox.
+
+## Documentation
+
+- [Setup and Google Workspace permissions](docs/setup.md)
+- [CLI commands and flags](docs/cli.md)
+- [Architecture and source map](docs/architecture.md)
+- [Operations, recovery, and credential rotation](docs/operations.md)
+- [Current limitations](docs/limitations.md)
+- [Development and verification](docs/development.md)
+- [Contributing](CONTRIBUTING.md), [code of conduct](CODE_OF_CONDUCT.md), and [support](SUPPORT.md)
+- [Security reporting](SECURITY.md), [privacy](PRIVACY.md), [software terms](TERMS.md), [licence](LICENSE), and [third-party notice](NOTICE)
+- [Changelog](CHANGELOG.md)
+
 ## Source
 
 - `bin/gmail-block`: Python engine

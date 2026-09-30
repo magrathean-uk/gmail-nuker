@@ -1,0 +1,8 @@
+gmail-nuker
+Copyright (c) 2026 MAGRATHEAN UK LTD and contributors.
+
+Gmail and Google Workspace are trademarks of Google. This project is independent of Google and has no Google endorsement.
+
+Runtime components are not bundled in this source repository: Python and its standard library, Swift/SwiftUI/Foundation, OpenSSL when used for signing, the host DNS tools, and optional Python cryptography. These components remain subject to their own licences. Installing them does not transfer their copyrights to this project.
+
+No third-party vendored library or dataset was identified in the initial source-only checkout. Maintainers must review provenance and update this notice when adding third-party material.
