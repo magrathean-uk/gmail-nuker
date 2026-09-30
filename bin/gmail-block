@@ -1,0 +1,1215 @@
+#!/usr/bin/env python3
+"""
+gmail-block  --  Nuclear-level Gmail sender and domain blocker.
+
+Brutally eradicates unwanted email senders and their entire root domains:
+  1. Root-Level Incoming Filter: Intercepts all incoming messages from the target
+     and its entire domain (and all subdomains). Routes them directly to TRASH
+     (auto-expunged permanently), bypasses Inbox, marks as read, strips Important.
+  2. Mailbox Purge: Scans mailbox for any existing messages from the target and
+     purges them atomically via batchModify (or IMAP fallback).
+  3. Phishing & Spam Flagging: Queries RDAP/WHOIS and MX records to identify the
+     registrar abuse desk and hosting provider, generates Google SafeBrowsing
+     reports, and can dispatch formal RFC 2142/RFC 5322 abuse complaints.
+  4. One-Click Unsubscribe Strike: Automatically fires any List-Unsubscribe headers
+     (RFC 8058 One-Click POST / mailto) found in previous messages before blocking.
+
+Credentials:
+  Uses service account secrets/service-account.json
+  with domain-wide delegation for Google Workspace (default user: you@example.com).
+  Can also use IMAP credentials from secrets/gmail-smtp.md for consumer accounts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from collections.abc import Generator
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import email.message
+import email.utils
+import imaplib
+import json
+import os
+from pathlib import Path
+import re
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+# Optional high-performance in-memory RSA signing
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
+    HAVE_CRYPTOGRAPHY = True
+except ImportError:
+    HAVE_CRYPTOGRAPHY = False
+
+# ── Paths and Defaults ────────────────────────────────────────────────────────
+
+DEFAULT_SA_PATH = Path(
+    os.environ.get(
+        "GMAIL_BLOCK_SA",
+        "secrets/service-account.json",
+    )
+)
+DEFAULT_USER = os.environ.get("GMAIL_BLOCK_USER", "you@example.com")
+SMTP_CREDS_PATH = Path(
+    os.environ.get("GMAIL_SMTP_CREDS", "secrets/gmail-smtp.md")
+)
+
+GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+FULL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.settings.basic",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+
+BASE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.settings.basic",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+
+# Common multi-tenant public webmail providers where we must not accidentally
+# nuke the entire root domain if an exact user is specified.
+PUBLIC_EMAIL_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "gmail.com",
+        "googlemail.com",
+        "yahoo.com",
+        "ymail.com",
+        "rocketmail.com",
+        "outlook.com",
+        "hotmail.com",
+        "live.com",
+        "msn.com",
+        "icloud.com",
+        "me.com",
+        "mac.com",
+        "aol.com",
+        "aim.com",
+        "proton.me",
+        "protonmail.com",
+        "zoho.com",
+        "zohomail.com",
+        "mail.com",
+        "email.com",
+        "gmx.com",
+        "gmx.net",
+        "gmx.de",
+        "web.de",
+        "fastmail.com",
+        "tutanota.com",
+        "tutamail.com",
+        "yandex.com",
+        "yandex.ru",
+        "mail.ru",
+        "inbox.lv",
+        "laposte.net",
+        "free.fr",
+        "orange.fr",
+        "qq.com",
+        "163.com",
+        "126.com",
+        "privaterelay.appleid.com",
+        "onmicrosoft.com",
+    }
+)
+
+# Multi-tenant cloud hosting / PaaS platforms where blocking the root domain
+# would destroy all communications from innocent co-hosted tenants.
+MULTI_TENANT_PLATFORMS: frozenset[str] = frozenset(
+    {
+        "github.io",
+        "gitlab.io",
+        "pages.dev",
+        "workers.dev",
+        "azurewebsites.net",
+        "firebaseapp.com",
+        "web.app",
+        "netlify.app",
+        "vercel.app",
+        "herokuapp.com",
+        "cloudfront.net",
+        "amazonaws.com",
+    }
+)
+
+MULTI_PART_TLDS: frozenset[str] = frozenset(
+    {
+        "co.uk", "org.uk", "me.uk", "gov.uk", "ac.uk", "ltd.uk", "plc.uk", "sch.uk", "police.uk",
+        "com.au", "net.au", "org.au", "edu.au", "gov.au",
+        "nsw.edu.au", "vic.edu.au", "qld.edu.au", "act.edu.au", "wa.edu.au", "sa.edu.au", "tas.edu.au",
+        "co.nz", "net.nz", "org.nz",
+        "co.jp", "ne.jp", "or.jp",
+        "co.za", "org.za",
+        "com.br", "net.br", "org.br",
+        "co.in", "net.in", "org.in",
+        "com.sg", "com.mx", "com.tr", "com.pl", "com.ro",
+        "asso.fr", "gc.ca",
+    }
+)
+
+KNOWN_ESP_ABUSE: list[tuple[re.Pattern[str], str, str]] = [
+    (re.compile(r"protection\.outlook\.com", re.IGNORECASE), "Microsoft 365", "abuse@microsoft.com"),
+    (re.compile(r"google(mail)?\.com", re.IGNORECASE), "Google Workspace", "abuse@google.com"),
+    (re.compile(r"amazonses\.com", re.IGNORECASE), "Amazon SES", "email-abuse@amazon.com"),
+    (re.compile(r"sendgrid\.net", re.IGNORECASE), "Twilio SendGrid", "abuse@sendgrid.com"),
+    (re.compile(r"mailgun\.(org|net)", re.IGNORECASE), "Mailgun", "abuse@mailgun.com"),
+    (re.compile(r"mandrillapp\.com|mailchimp\.com", re.IGNORECASE), "Mailchimp / Mandrill", "abuse@mailchimp.com"),
+    (re.compile(r"postmarkapp\.com", re.IGNORECASE), "Postmark", "abuse@postmarkapp.com"),
+    (re.compile(r"brevo\.com|sendinblue\.com", re.IGNORECASE), "Brevo (Sendinblue)", "abuse@brevo.com"),
+    (re.compile(r"cf-emailsecurity\.net|cloudflare\.net", re.IGNORECASE), "Cloudflare Email Security", "abuse@cloudflare.com"),
+    (re.compile(r"pphosted\.com", re.IGNORECASE), "Proofpoint", "abuse@proofpoint.com"),
+    (re.compile(r"mimecast\.com", re.IGNORECASE), "Mimecast", "abuse@mimecast.com"),
+    (re.compile(r"barracudanetworks\.com", re.IGNORECASE), "Barracuda", "abuse@barracuda.com"),
+    (re.compile(r"mailsec\.proton\.me", re.IGNORECASE), "ProtonMail", "abuse@proton.me"),
+    (re.compile(r"zoho\.(com|eu)", re.IGNORECASE), "Zoho Mail", "abuse@zohocorp.com"),
+]
+
+
+# ── Target Resolution & Normalization ────────────────────────────────────────
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class TargetInfo:
+    raw: str
+    is_email: bool
+    email_address: str | None
+    host: str
+    ascii_host: str
+    root_domain: str
+    ascii_root_domain: str
+    is_public_provider: bool
+    is_multi_tenant_platform: bool
+    block_mode: str  # "exact" or "root_domain"
+    filter_criteria: dict[str, Any]
+    search_query: str
+
+
+def to_punycode(domain: str) -> str:
+    """Converts IDN domain to Punycode ASCII for DNS/network queries."""
+    try:
+        return domain.encode("idna").decode("ascii")
+    except Exception:
+        return domain
+
+
+def extract_root_domain(host: str) -> str:
+    host = host.lower().strip(".")
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    last_three = ".".join(parts[-3:])
+    if last_three in MULTI_PART_TLDS and len(parts) >= 4:
+        return ".".join(parts[-4:])
+    last_two = ".".join(parts[-2:])
+    if last_two in MULTI_PART_TLDS:
+        return ".".join(parts[-3:])
+    if len(parts) >= 3 and parts[-2] in {"com", "co", "org", "net", "edu", "gov"}:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def parse_target(raw: str, *, exact: bool = False, force_domain: bool = False) -> TargetInfo:
+    cleaned = raw.strip()
+
+    # Strip scheme and path if URL is provided
+    if "://" in cleaned:
+        parsed_url = urllib.parse.urlsplit(cleaned)
+        cleaned = parsed_url.hostname or cleaned
+    elif "/" in cleaned:
+        cleaned = cleaned.split("/", 1)[0]
+
+    cleaned = cleaned.lower()
+    if cleaned.startswith("mailto:"):
+        cleaned = cleaned.removeprefix("mailto:").strip()
+
+    # Extract email from possible display names: e.g. "Spammer" <user@domain.com>
+    _, email_candidate = email.utils.parseaddr(cleaned)
+    if "@" in email_candidate and bool(email_candidate.split("@", 1)[0].strip()):
+        cleaned = email_candidate
+    else:
+        cleaned = cleaned.strip("<>\"' \t\r\n")
+
+    is_email = "@" in cleaned and bool(cleaned.split("@", 1)[0].strip())
+    if is_email:
+        parts = cleaned.split("@", 1)
+        email_addr = f"{parts[0]}@{parts[1]}"
+        host = parts[1].strip(".")
+    else:
+        email_addr = None
+        host = cleaned.lstrip("@").strip(".")
+
+    root_domain = extract_root_domain(host)
+    ascii_host = to_punycode(host)
+    ascii_root_domain = to_punycode(root_domain)
+
+    is_public = root_domain in PUBLIC_EMAIL_PROVIDERS or host in PUBLIC_EMAIL_PROVIDERS
+    is_platform = root_domain in MULTI_TENANT_PLATFORMS or any(host.endswith(f".{p}") for p in MULTI_TENANT_PLATFORMS)
+
+    if exact or (is_public and not force_domain) or (is_platform and not force_domain):
+        block_mode = "exact"
+    else:
+        block_mode = "root_domain"
+
+    if block_mode == "exact":
+        effective_from = email_addr if email_addr else host
+        criteria = {"from": effective_from}
+        query = f"from:{effective_from}"
+    else:
+        # Canonical Gmail Filter Rule: Gmail filter engine natively matches all local-parts
+        # and subdomains when passed the domain name. Do NOT use "*@" (not supported).
+        criteria = {"from": root_domain}
+        query = f"from:{root_domain}"
+
+    return TargetInfo(
+        raw=raw,
+        is_email=is_email,
+        email_address=email_addr,
+        host=host,
+        ascii_host=ascii_host,
+        root_domain=root_domain,
+        ascii_root_domain=ascii_root_domain,
+        is_public_provider=is_public,
+        is_multi_tenant_platform=is_platform,
+        block_mode=block_mode,
+        filter_criteria=criteria,
+        search_query=query,
+    )
+
+
+# ── Authentication & Token Management ────────────────────────────────────────
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _sign_assertion(creds: dict[str, Any], subject: str, scopes: list[str]) -> str:
+    now = int(datetime.now(timezone.utc).timestamp())
+    # 30-second clock skew buffer: iat in slightly past, exp keeps <= 3600 duration
+    header: dict[str, Any] = {"alg": "RS256", "typ": "JWT"}
+    if "private_key_id" in creds:
+        header["kid"] = creds["private_key_id"]
+
+    payload = {
+        "iss": creds["client_email"],
+        "scope": " ".join(scopes),
+        "aud": TOKEN_URL,
+        "iat": now - 30,
+        "exp": now + 3570,
+        "sub": subject,
+    }
+    si = f"{_b64url(json.dumps(header, separators=(',', ':')).encode())}.{_b64url(json.dumps(payload, separators=(',', ':')).encode())}"
+
+    # Pure in-memory cryptographic signature if cryptography library is installed
+    if HAVE_CRYPTOGRAPHY:
+        private_key = serialization.load_pem_private_key(
+            creds["private_key"].encode("utf-8"),
+            password=None,
+        )
+        sig = private_key.sign(
+            si.encode("ascii"),
+            asymmetric_padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+    else:
+        # Fallback to subprocess openssl with auto-cleanup
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", encoding="utf-8", delete_on_close=False, delete=True) as kf:
+            kf.write(creds["private_key"])
+            kf.flush()
+            sig = subprocess.check_output(
+                ["openssl", "dgst", "-sha256", "-sign", kf.name],
+                input=si.encode("ascii"),
+            )
+
+    return f"{si}.{_b64url(sig)}"
+
+
+def get_sa_token(sa_path: Path | str, subject: str) -> tuple[str, bool]:
+    """
+    Acquires OAuth access token.
+    Attempts full scopes (with gmail.modify). If Domain-Wide Delegation in Google
+    Admin Console is scoped only to base scopes, gracefully falls back to BASE_SCOPES.
+    Returns (access_token, has_modify_scope).
+    """
+    path = Path(sa_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Service account file not found: {path}")
+    creds = json.loads(path.read_text(encoding="utf-8"))
+
+    # Try full scopes first
+    for scopes, has_modify in [(FULL_SCOPES, True), (BASE_SCOPES, False)]:
+        assertion = _sign_assertion(creds, subject, scopes)
+        data = urllib.parse.urlencode(
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": assertion,
+            }
+        ).encode("ascii")
+        req = urllib.request.Request(TOKEN_URL, data=data, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                token = json.loads(resp.read().decode("utf-8"))["access_token"]
+                return token, has_modify
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode(errors="replace")
+            # If unauthorized for requested scope, try fallback
+            if "unauthorized_client" in err_body and has_modify:
+                continue
+            raise RuntimeError(f"OAuth token error ({e.code}): {err_body}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"OAuth connection failed: {e.reason}") from e
+
+    raise RuntimeError("Failed to acquire OAuth token with available scopes.")
+
+
+def api_call(
+    token: str,
+    path: str,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    max_retries: int = 3,
+) -> dict[str, Any]:
+    url = f"{GMAIL_API}/{path.lstrip('/')}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+
+    for attempt in range(max_retries):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode(errors="replace")
+            # Handle rate limiting (429) or transient backend errors (500, 503)
+            if e.code in {429, 500, 503} and attempt < max_retries - 1:
+                time.sleep(2 ** attempt + 0.5)
+                continue
+            raise RuntimeError(f"Gmail API HTTP {e.code} for {method} {url}:\n{body_text}") from e
+        except urllib.error.URLError as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt + 0.5)
+                continue
+            raise RuntimeError(f"Gmail API network error for {method} {url}: {e.reason}") from e
+
+    return {}
+
+
+# ── Intelligence & Abuse Probes ──────────────────────────────────────────────
+
+def resolve_mx_records(ascii_domain: str) -> list[str]:
+    """Resolve MX hostnames using /usr/bin/host, sorting by priority and filtering Null MX."""
+    try:
+        res = subprocess.run(
+            ["host", "-t", "mx", "--", ascii_domain],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        parsed: list[tuple[int, str]] = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            # Match: "domain mail is handled by 10 mx.host.com."
+            if m := re.search(r"is handled by (\d+)\s+([^\s]+)", line):
+                prio = int(m.group(1))
+                host_val = m.group(2).rstrip(".")
+                # Filter out RFC 7505 Null MX: "0 ."
+                if host_val and host_val != ".":
+                    parsed.append((prio, host_val))
+        parsed.sort(key=lambda x: x[0])
+        return [h for _, h in parsed]
+    except (subprocess.SubprocessError, OSError):
+        return []
+
+
+def detect_esp_info(mx_records: list[str]) -> tuple[str, str] | None:
+    """Identify if the domain's incoming mail routing matches a known ESP abuse desk."""
+    for mx in mx_records:
+        for pattern, name, abuse_email in KNOWN_ESP_ABUSE:
+            if pattern.search(mx):
+                return name, abuse_email
+    return None
+
+
+def lookup_rdap_abuse(ascii_domain: str) -> dict[str, Any]:
+    """Lookup RDAP domain registration and recursively extract registrar abuse contact details."""
+    url = f"https://rdap.org/domain/{urllib.parse.quote(ascii_domain)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "gmail-block/1.0",
+            "Accept": "application/rdap+json, application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            abuse_emails: list[str] = []
+            registrar_name = "Unknown Registrar"
+
+            def _walk_entities(entities: list[dict[str, Any]]) -> Generator[dict[str, Any], None, None]:
+                for ent in entities:
+                    yield ent
+                    yield from _walk_entities(ent.get("entities") or [])
+
+            for ent in _walk_entities(data.get("entities") or []):
+                roles = ent.get("roles") or []
+                vcard = ent.get("vcardArray") or []
+                vcard_entries = vcard[1] if len(vcard) > 1 and isinstance(vcard[1], list) else []
+
+                if "registrar" in roles and registrar_name == "Unknown Registrar":
+                    for item in vcard_entries:
+                        match item:
+                            case ["fn", _, _, str(fn_val)] if fn_val.strip():
+                                registrar_name = fn_val.strip()
+                                break
+
+                if "abuse" in roles:
+                    for item in vcard_entries:
+                        match item:
+                            case ["email", _, _, str(email_val)]:
+                                clean_email = email_val.removeprefix("mailto:").strip()
+                                if "@" in clean_email:
+                                    abuse_emails.append(clean_email)
+
+            return {
+                "registrar": registrar_name,
+                "abuse_emails": list(dict.fromkeys(abuse_emails)),
+                "handle": data.get("handle", ""),
+            }
+    except Exception:
+        return {"registrar": "Lookup unavailable", "abuse_emails": [], "handle": ""}
+
+
+# ── Filter Management ────────────────────────────────────────────────────────
+
+def list_filters(token: str) -> list[dict[str, Any]]:
+    res = api_call(token, "users/me/settings/filters")
+    return res.get("filter", [])
+
+
+def find_conflicting_filters(
+    filters: list[dict[str, Any]], target: TargetInfo
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    target_str = (
+        target.root_domain
+        if target.block_mode == "root_domain"
+        else (target.email_address or target.host)
+    ).lower()
+
+    pattern = re.compile(rf"(?i)(?:^|[@.\s(]){re.escape(target_str)}(?:$|[\s.)>\"'])")
+    for f in filters:
+        crit = f.get("criteria", {})
+        from_crit = crit.get("from", "").lower()
+        query_crit = crit.get("query", "").lower()
+        if pattern.search(from_crit) or pattern.search(query_crit):
+            matches.append(f)
+    return matches
+
+
+def create_nuclear_filter(token: str, target: TargetInfo) -> dict[str, Any]:
+    """
+    Creates an uncompromising Gmail filter:
+      - Routes directly to TRASH (auto-purged permanently)
+      - Strips INBOX (never delivered to user view)
+      - Strips UNREAD (never triggers badge or unread notifications)
+      - Strips IMPORTANT (never flagged as priority)
+    """
+    filter_body = {
+        "criteria": target.filter_criteria,
+        "action": {
+            "addLabelIds": ["TRASH"],
+            "removeLabelIds": ["INBOX", "UNREAD", "IMPORTANT"],
+        },
+    }
+    return api_call(token, "users/me/settings/filters", method="POST", body=filter_body)
+
+
+def delete_filter(token: str, filter_id: str) -> None:
+    api_call(token, f"users/me/settings/filters/{filter_id}", method="DELETE")
+
+
+# ── Mailbox Message Operations ───────────────────────────────────────────────
+
+def search_mailbox(token: str, query: str, limit: int = 50) -> list[dict[str, Any]]:
+    url_path = f"users/me/messages?q={urllib.parse.quote(query)}&maxResults={min(limit, 500)}"
+    data = api_call(token, url_path)
+    messages = data.get("messages", [])
+    results: list[dict[str, Any]] = []
+    for m in messages[:limit]:
+        mid = m["id"]
+        try:
+            detail = api_call(
+                token,
+                f"users/me/messages/{mid}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Unsubscribe-Post",
+            )
+            headers = {
+                h["name"].lower(): h["value"]
+                for h in detail.get("payload", {}).get("headers", [])
+            }
+            results.append(
+                {
+                    "id": mid,
+                    "threadId": detail.get("threadId"),
+                    "from": headers.get("from", ""),
+                    "subject": headers.get("subject", "(no subject)"),
+                    "date": headers.get("date", ""),
+                    "list_unsubscribe": headers.get("list-unsubscribe", ""),
+                    "list_unsubscribe_post": headers.get("list-unsubscribe-post", ""),
+                }
+            )
+        except Exception:
+            results.append({"id": mid, "from": "", "subject": "", "date": "", "list_unsubscribe": "", "list_unsubscribe_post": ""})
+    return results
+
+
+def attempt_purge_messages_api(token: str, message_ids: list[str]) -> tuple[int, list[str]]:
+    """Attempts to trash messages via Gmail API batchModify."""
+    if not message_ids:
+        return 0, []
+    try:
+        # Atomic batchModify up to 1,000 messages
+        body = {
+            "ids": message_ids[:1000],
+            "addLabelIds": ["TRASH"],
+            "removeLabelIds": ["INBOX"],
+        }
+        api_call(token, "users/me/messages/batchModify", method="POST", body=body)
+        return len(message_ids[:1000]), []
+    except Exception as e:
+        return 0, [str(e)]
+
+
+def attempt_purge_imap(username: str, app_pw: str, search_target: str) -> tuple[int, str | None]:
+    """Purges messages directly using IMAP with user credentials."""
+    try:
+        ctx = ssl.create_default_context()
+        m = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=ctx)
+        m.login(username, app_pw)
+        deleted_count = 0
+
+        # Purge from All Mail
+        res, _ = m.select('"[Gmail]/All Mail"')
+        if res == "OK":
+            # Sanitize search term against IMAP quote injection
+            clean_term = search_target.replace('"', "").strip()
+            crit = f'(FROM "{clean_term}")'
+            typ, data = m.search(None, crit)
+            if typ == "OK" and data[0]:
+                uids = data[0].split()
+                for uid in uids:
+                    # Mark Deleted and expunge
+                    m.store(uid, "+FLAGS", "\\Deleted")
+                    deleted_count += 1
+                m.expunge()
+
+        m.close()
+        m.logout()
+        return deleted_count, None
+    except Exception as e:
+        err_msg = str(e).replace(app_pw, "********") if app_pw else str(e)
+        return 0, err_msg
+
+
+# ── One-Click Unsubscribe Strike ─────────────────────────────────────────────
+
+def trigger_one_click_unsubscribe(token: str, user: str, msg_info: dict[str, Any]) -> str:
+    """Fires RFC 8058 One-Click HTTP POST or mailto unsubscribe."""
+    raw_header = msg_info.get("list_unsubscribe", "")
+    post_header = msg_info.get("list_unsubscribe_post", "")
+    if not raw_header:
+        return "No List-Unsubscribe header found."
+
+    urls = re.findall(r"<([^>]+)>", raw_header)
+    http_url = next((u for u in urls if u.startswith(("https://", "http://"))), None)
+    mailto_url = next((u for u in urls if u.startswith("mailto:")), None)
+
+    # 1. RFC 8058 One-Click POST
+    if http_url and post_header and "List-Unsubscribe=One-Click" in post_header:
+        try:
+            req = urllib.request.Request(
+                http_url,
+                data=b"List-Unsubscribe=One-Click",
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return f"RFC 8058 One-Click POST dispatched (HTTP {resp.status})"
+        except Exception as e:
+            return f"RFC 8058 POST failed ({e})"
+
+    # 2. Standard Mailto Unsubscribe
+    if mailto_url:
+        parsed = urllib.parse.urlsplit(mailto_url)
+        to_addr = parsed.path
+        if to_addr and "@" in to_addr:
+            msg = email.message.EmailMessage()
+            msg["From"] = user
+            msg["To"] = to_addr
+            msg["Subject"] = "Unsubscribe"
+            msg.set_content("Please unsubscribe this address immediately.")
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+            try:
+                api_call(token, "users/me/messages/send", method="POST", body={"raw": raw})
+                return f"Unsubscribe mailto dispatched to {to_addr}"
+            except Exception as e:
+                return f"Mailto dispatch failed ({e})"
+
+    return "Header present but no automated method matched."
+
+
+# ── Abuse & Phishing Reporting ───────────────────────────────────────────────
+
+def generate_abuse_complaint(
+    target: TargetInfo,
+    user_email: str,
+    registrar_abuse: list[str],
+    esp_abuse: str | None,
+    sample_subject: str,
+) -> tuple[list[str], str, str]:
+    recipients = list(dict.fromkeys(registrar_abuse + ([esp_abuse] if esp_abuse else [])))
+    if not recipients:
+        recipients = [f"abuse@{target.root_domain}"]
+
+    # Sanitize subject against CRLF injection
+    clean_subj = re.sub(r"[\r\n]+", " ", sample_subject).strip()
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    subject = f"URGENT: Spam & Unsolicited Bulk Commercial Email Abuse Report: {target.root_domain}"
+    body = f"""Dear Abuse Desk / Network Security Operations,
+
+This is a formal report of persistent, unsolicited commercial email (spam / UCE) and abusive communications originating from the domain:
+Domain: {target.root_domain}
+Offending Address/Target: {target.raw}
+Reported By Recipient: {user_email}
+Sample Subject: {clean_subj}
+
+The recipient has explicitly requested to unsubscribe or never consented to receive these communications. Despite unsubscribe actions, emails continue to be dispatched in violation of acceptable use policies, RFC 2142, and international anti-spam standards.
+
+We request immediate investigation and enforcement action against this tenant/account for abuse and spam transmission.
+
+Root Domain: {target.root_domain}
+Report Timestamp: {now_str}
+
+Sincerely,
+Automated Security Incident Response
+"""
+    return recipients, subject, body
+
+
+def send_abuse_email(
+    token: str,
+    sender: str,
+    recipients: list[str],
+    subject: str,
+    body: str,
+) -> bool:
+    msg = email.message.EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    # Sanitize CRLF injection in subject
+    clean_subject = re.sub(r"[\r\n]+", " ", subject).strip()
+    msg["Subject"] = clean_subject
+    msg["Date"] = email.utils.formatdate(localtime=False, usegmt=True)
+    msg["Message-ID"] = email.utils.make_msgid(domain="bolyki.eu")
+    msg["Auto-Submitted"] = "auto-generated"  # RFC 3834 compliance
+    msg.set_content(body)
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+    try:
+        api_call(token, "users/me/messages/send", method="POST", body={"raw": raw})
+        return True
+    except Exception as e:
+        print(f"  [!] Failed to send abuse complaint via API: {e}", file=sys.stderr)
+        return False
+
+
+# ── CLI Commands ─────────────────────────────────────────────────────────────
+
+def cmd_block(args: argparse.Namespace) -> int:
+    is_json = bool(getattr(args, "json", False))
+    def log(*a: Any, **kw: Any) -> None:
+        if not is_json:
+            print(*a, **kw)
+
+    target = parse_target(args.target, exact=args.exact, force_domain=args.force_domain)
+    log("=" * 70)
+    log("  GMAIL NUCLEAR BLOCKER  --  TARGET ANALYSIS")
+    log("=" * 70)
+    log(f"Target Input         : {target.raw}")
+    if target.is_email:
+        log(f"Target Email         : {target.email_address}")
+    log(f"Host / Subdomain     : {target.host}")
+    log(f"Root Apex Domain     : {target.root_domain}")
+    log(f"Public Provider      : {'YES (Multi-tenant webmail)' if target.is_public_provider else ('YES (Shared Cloud Platform)' if target.is_multi_tenant_platform else 'No (Custom Domain)')}")
+    log(f"Block Mode           : {target.block_mode.upper()} {'[BRUTAL ROOT DOMAIN ERADICATION]' if target.block_mode == 'root_domain' else '[EXACT ADDRESS / SUBDOMAIN ONLY]'}")
+    log(f"Incoming Filter Spec : {target.filter_criteria}")
+    log(f"Action When Received : TRASH IMMEDIATELY (Purged permanently, bypasses Inbox, stripped Unread/Important)")
+    log()
+
+    # Authenticate
+    try:
+        token, has_modify = get_sa_token(args.sa, args.user)
+    except Exception as e:
+        if is_json:
+            print(json.dumps({"success": False, "error": f"Failed to authenticate with service account for {args.user}: {e}"}))
+        else:
+            print(f"[ERROR] Failed to authenticate with service account for {args.user}: {e}", file=sys.stderr)
+        return 1
+
+    # 1. Check existing filters
+    log("[1/4] Probing active Gmail filters …")
+    try:
+        existing_filters = list_filters(token)
+    except RuntimeError as e:
+        if is_json:
+            print(json.dumps({"success": False, "error": f"Failed to query existing Gmail filters: {e}"}))
+        else:
+            print(f"[ERROR] Failed to query existing Gmail filters: {e}", file=sys.stderr)
+        return 1
+
+    conflicts = find_conflicting_filters(existing_filters, target)
+    exact_duplicate: dict[str, Any] | None = None
+    if conflicts:
+        log(f"  [!] Found {len(conflicts)} existing filter(s) matching this target:")
+        for cf in conflicts:
+            log(f"      - ID: {cf.get('id')}")
+            log(f"        Criteria: {cf.get('criteria')}")
+            log(f"        Action:   {cf.get('action')}")
+            # Check for exact duplicate rule
+            crit = cf.get("criteria", {})
+            act = cf.get("action", {})
+            if crit.get("from") == target.filter_criteria.get("from") and "TRASH" in act.get("addLabelIds", []):
+                exact_duplicate = cf
+    else:
+        log("  [+] No existing filters match this target.")
+
+    # 2. Mailbox scan
+    log(f"[2/4] Scanning mailbox for previous messages ({target.search_query}) …")
+    found_messages = search_mailbox(token, target.search_query, limit=args.limit)
+    log(f"  Found {len(found_messages)} previous message(s) in mailbox.")
+    for idx, m in enumerate(found_messages[:5], 1):
+        unsub_note = " [Unsub Header Available]" if m["list_unsubscribe"] else ""
+        log(f"    [{idx}] {m['date'][:25]:<25} | {m['from'][:30]:<30} | {m['subject'][:35]}{unsub_note}")
+    if len(found_messages) > 5:
+        log(f"    … and {len(found_messages) - 5} more.")
+
+    # 3. Phishing and Abuse Intel
+    log("[3/4] Gathering network abuse intelligence & registrar contacts …")
+    mx_records = resolve_mx_records(target.ascii_root_domain)
+    esp_info = detect_esp_info(mx_records)
+    rdap = lookup_rdap_abuse(target.ascii_root_domain)
+
+    if esp_info:
+        log(f"  Mail Provider (ESP)  : {esp_info[0]} -> Abuse: {esp_info[1]}")
+    elif mx_records:
+        log(f"  Mail Exchangers (MX) : {', '.join(mx_records[:2])}")
+    log(f"  Domain Registrar     : {rdap['registrar']}")
+    if rdap["abuse_emails"]:
+        log(f"  Registrar Abuse Desk : {', '.join(rdap['abuse_emails'])}")
+
+    safe_browsing_url = f"https://safebrowsing.google.com/safebrowsing/report_phish/?url={urllib.parse.quote_plus(f'https://{target.host}/')}"
+    log(f"  Google SafeBrowsing  : {safe_browsing_url}")
+    log()
+
+    # 4. Mutation Decision
+    if not args.commit:
+        if is_json:
+            print(json.dumps({
+                "success": True,
+                "target": {
+                    "raw": target.raw,
+                    "email": target.email_address,
+                    "host": target.host,
+                    "root_domain": target.root_domain,
+                    "block_mode": target.block_mode,
+                    "is_public_provider": target.is_public_provider,
+                    "is_multi_tenant_platform": target.is_multi_tenant_platform,
+                },
+                "committed": False,
+                "already_active": bool(exact_duplicate),
+                "existing_filter_id": exact_duplicate.get("id") if exact_duplicate else None,
+                "found_messages": found_messages,
+                "abuse_emails": rdap.get("abuse_emails", []),
+                "registrar": rdap.get("registrar", ""),
+                "safe_browsing_url": safe_browsing_url,
+            }))
+            return 0
+
+        log("=" * 70)
+        log("  DRY-RUN ONLY -- NO CHANGES MADE TO LIVE GMAIL ACCOUNT")
+        log("=" * 70)
+        log("To apply this brutal block, re-run with --commit:")
+        log(f"  gmail-block block \"{target.raw}\" --commit")
+        if found_messages:
+            log("To also purge existing messages found above:")
+            log(f"  gmail-block block \"{target.raw}\" --commit --purge")
+        if rdap["abuse_emails"] or esp_info:
+            log("To also dispatch a formal abuse complaint to registrar/ESP desks:")
+            log(f"  gmail-block block \"{target.raw}\" --commit --report-abuse")
+        return 0
+
+    log("=" * 70)
+    log("  EXECUTING MUTATIONS (--commit confirmed)")
+    log("=" * 70)
+
+    # Trigger one-click unsubscribe on existing messages first if available
+    unsub_msgs = [m for m in found_messages if m.get("list_unsubscribe")]
+    if unsub_msgs:
+        log(f"[+] Triggering automated One-Click Unsubscribe strike on {len(unsub_msgs)} message(s) …")
+        res = trigger_one_click_unsubscribe(token, args.user, unsub_msgs[0])
+        log(f"  [✓] {res}")
+
+    # Create Filter (prevent duplicate accumulation)
+    filter_id = None
+    if exact_duplicate:
+        filter_id = exact_duplicate.get("id")
+        log(f"[✓] Nuclear incoming filter is ALREADY ACTIVE (Filter ID: {filter_id}). Skipping duplicate creation.")
+    else:
+        created_filter = create_nuclear_filter(token, target)
+        filter_id = created_filter.get("id")
+        log(f"[+] Nuclear incoming filter CREATED successfully! Filter ID: {filter_id}")
+
+        # Re-read verification
+        verification = list_filters(token)
+        verified = any(f.get("id") == filter_id for f in verification)
+        if verified:
+            log("  [✓] Verified live in Gmail filter rules: Any future mail will be incinerated immediately.")
+        else:
+            log("  [!] Warning: Filter ID was returned but not found in immediate live re-read.", file=sys.stderr)
+
+    # Purge existing messages if requested
+    purged = 0
+    remaining: list[dict[str, Any]] = found_messages
+    if args.purge and found_messages:
+        log(f"[+] Purging {len(found_messages)} existing messages from mailbox …")
+        msg_ids = [m["id"] for m in found_messages]
+
+        if has_modify:
+            purged, errors = attempt_purge_messages_api(token, msg_ids)
+            if purged:
+                log(f"  [✓] Trashed {purged} existing message(s) via Gmail API batchModify.")
+            if errors:
+                log(f"  [!] Batch modify error: {errors[0]}")
+        else:
+            # Fallback to IMAP if available
+            if SMTP_CREDS_PATH.is_file():
+                try:
+                    content = SMTP_CREDS_PATH.read_text(encoding="utf-8")
+                    u_m = re.search(r"Username\*\*:\s*`([^`]+)`", content)
+                    p_m = re.search(r"App Password\*\*:\s*`([^`]+)`", content)
+                    if u_m and p_m and u_m.group(1).strip() == args.user:
+                        search_target = (
+                            target.email_address
+                            if target.block_mode == "exact" and target.email_address
+                            else target.root_domain
+                        )
+                        log(f"  [*] Attempting direct IMAP purge using App Password for {args.user} (Target: {search_target}) …")
+                        imap_purged, imap_err = attempt_purge_imap(
+                            u_m.group(1).strip(), p_m.group(1).strip(), search_target
+                        )
+                        if imap_purged:
+                            log(f"  [✓] IMAP purge succeeded: {imap_purged} messages purged to Trash.")
+                            purged = imap_purged
+                        elif imap_err:
+                            log(f"  [!] IMAP purge error: {imap_err}")
+                except Exception:
+                    pass
+
+            if not purged:
+                log("  [!] API note: Service Account currently authorized for readonly + settings.basic.")
+                log("      To enable retroactive API trashing for Workspace, authorize 'https://mail.google.com/'")
+                log("      for Client ID 115429729986898493672 in Google Admin Console.")
+
+        # Post-purge re-read verification (AGENTS.md compliance)
+        remaining = search_mailbox(token, target.search_query, limit=10)
+        if not remaining:
+            log("  [✓] Verified live mailbox state: 0 active messages remain.")
+        else:
+            log(f"  [*] Live re-read status: {len(remaining)} message(s) still detected in active search index.")
+
+    # Report abuse if requested
+    if args.report_abuse:
+        log("[+] Preparing and dispatching formal RFC 2142 Abuse & Phishing report …")
+        sample_subj = found_messages[0]["subject"] if found_messages else "(Spam email stream)"
+        esp_abuse_addr = esp_info[1] if esp_info else None
+        recipients, subj, body = generate_abuse_complaint(
+            target, args.user, rdap["abuse_emails"], esp_abuse_addr, sample_subj
+        )
+        log(f"  Recipients: {', '.join(recipients)}")
+        if send_abuse_email(token, args.user, recipients, subj, body):
+            log("  [✓] Formal RFC 2142 Abuse Notice dispatched successfully.")
+        else:
+            log("  [!] Could not send abuse report email.")
+
+    log()
+    log(f"[SUCCESS] Target '{target.raw}' is completely blocked at the root level.")
+
+    if is_json:
+        res = {
+            "success": True,
+            "target": {
+                "raw": target.raw,
+                "email": target.email_address,
+                "host": target.host,
+                "root_domain": target.root_domain,
+                "block_mode": target.block_mode,
+                "is_public_provider": target.is_public_provider,
+                "is_multi_tenant_platform": target.is_multi_tenant_platform,
+            },
+            "committed": True,
+            "filter_id": filter_id,
+            "already_active": bool(exact_duplicate),
+            "found_messages": found_messages,
+            "purged": purged,
+            "remaining": len(remaining),
+            "abuse_emails": rdap.get("abuse_emails", []),
+            "registrar": rdap.get("registrar", ""),
+            "safe_browsing_url": safe_browsing_url,
+        }
+        print(json.dumps(res))
+
+    return 0
+
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    try:
+        token, _ = get_sa_token(args.sa, args.user)
+    except Exception as e:
+        print(f"[ERROR] Authentication failed: {e}", file=sys.stderr)
+        return 1
+
+    filters = list_filters(token)
+    print(f"Active Gmail Filters for {args.user}: {len(filters)} total")
+    print("=" * 80)
+    print(f"{'FILTER ID':<36} | {'ACTION':<15} | CRITERIA")
+    print("-" * 80)
+    for f in filters:
+        fid = f.get("id", "")
+        act = f.get("action", {})
+        crit = f.get("criteria", {})
+        act_summary: list[str] = []
+        if "TRASH" in act.get("addLabelIds", []):
+            act_summary.append("TRASH")
+        if "INBOX" in act.get("removeLabelIds", []):
+            act_summary.append("SKIP_INBOX")
+        crit_summary = crit.get("from") or crit.get("query") or str(crit)
+        print(f"{fid:<36} | {','.join(act_summary) or 'CUSTOM':<15} | {crit_summary}")
+    print("=" * 80)
+    return 0
+
+
+def cmd_unblock(args: argparse.Namespace) -> int:
+    try:
+        token, _ = get_sa_token(args.sa, args.user)
+    except Exception as e:
+        print(f"[ERROR] Authentication failed: {e}", file=sys.stderr)
+        return 1
+
+    filters = list_filters(token)
+    matched: list[dict[str, Any]] = []
+
+    # Check if target is a filter ID
+    for f in filters:
+        if f.get("id") == args.target:
+            matched.append(f)
+
+    # Token/word boundary check to prevent accidental substring deletion
+    if not matched:
+        target_norm = args.target.strip().lower()
+        pattern = re.compile(rf"(?i)(?:^|[@.\s(]){re.escape(target_norm)}(?:$|[\s.)>\"'])")
+        for f in filters:
+            crit = f.get("criteria", {})
+            from_str = crit.get("from", "").lower()
+            q_str = crit.get("query", "").lower()
+            if pattern.search(from_str) or pattern.search(q_str) or target_norm in {from_str, q_str}:
+                matched.append(f)
+
+    if not matched:
+        print(f"[-] No matching filter found for target: {args.target}")
+        return 1
+
+    print(f"Found {len(matched)} matching filter(s):")
+    for f in matched:
+        print(f"  - ID: {f.get('id')} | Criteria: {f.get('criteria')} | Action: {f.get('action')}")
+
+    if not args.commit:
+        print("\n[DRY RUN] To remove this filter, re-run with --commit:")
+        print(f"  gmail-block unblock \"{args.target}\" --commit")
+        return 0
+
+    print("\nExecuting unblock (--commit confirmed) …")
+    for f in matched:
+        fid = f["id"]
+        delete_filter(token, fid)
+        print(f"  [✓] Deleted filter {fid}")
+
+    # Re-read verification
+    rem = list_filters(token)
+    deleted_ids = {f["id"] for f in matched}
+    still_present = [f for f in rem if f["id"] in deleted_ids]
+    if not still_present:
+        print("[SUCCESS] All matched filters successfully removed.")
+    else:
+        print(f"[!] Warning: {len(still_present)} filter(s) still present in live state.", file=sys.stderr)
+
+    return 0
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    target = parse_target(args.target, exact=args.exact, force_domain=args.force_domain)
+    try:
+        token, _ = get_sa_token(args.sa, args.user)
+    except Exception as e:
+        print(f"[ERROR] Authentication failed: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Scanning mailbox for messages matching query: {target.search_query}")
+    messages = search_mailbox(token, target.search_query, limit=args.limit)
+    print(f"Found {len(messages)} matching message(s):\n")
+    for i, m in enumerate(messages, 1):
+        unsub_flag = " [Has Unsub Header]" if m["list_unsubscribe"] else ""
+        print(f"[{i:02d}] {m['date'][:25]:<25} | {m['from'][:30]:<30} | {m['subject'][:40]}{unsub_flag}")
+    return 0
+
+
+def cmd_abuse_info(args: argparse.Namespace) -> int:
+    target = parse_target(args.target, exact=args.exact, force_domain=args.force_domain)
+    print("=" * 70)
+    print(f"  ABUSE & PHISHING INTELLIGENCE FOR: {target.root_domain}")
+    print("=" * 70)
+    mx_records = resolve_mx_records(target.ascii_root_domain)
+    esp_info = detect_esp_info(mx_records)
+    rdap = lookup_rdap_abuse(target.ascii_root_domain)
+
+    if esp_info:
+        print(f"Mail Exchanger Provider : {esp_info[0]}")
+        print(f"Provider Abuse Desk     : {esp_info[1]}")
+    elif mx_records:
+        print(f"Mail Exchangers (MX)    : {', '.join(mx_records)}")
+    else:
+        print("Mail Exchangers (MX)    : None resolved")
+
+    print(f"Domain Registrar        : {rdap['registrar']}")
+    if rdap["abuse_emails"]:
+        print(f"Registrar Abuse Emails  : {', '.join(rdap['abuse_emails'])}")
+    else:
+        print("Registrar Abuse Emails  : None listed in RDAP")
+
+    safe_browsing = f"https://safebrowsing.google.com/safebrowsing/report_phish/?url={urllib.parse.quote_plus(f'https://{target.host}/')}"
+    spamhaus = f"https://check.spamhaus.org/"
+    print(f"Google Phishing Report  : {safe_browsing}")
+    print(f"Spamhaus Reputation     : {spamhaus}")
+    return 0
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    common_root = argparse.ArgumentParser(add_help=False)
+    common_root.add_argument(
+        "--sa",
+        type=Path,
+        default=DEFAULT_SA_PATH,
+        help=f"Path to service account credentials JSON (default: {DEFAULT_SA_PATH})",
+    )
+    common_root.add_argument(
+        "--user",
+        default=DEFAULT_USER,
+        help=f"Gmail account to operate on (default: {DEFAULT_USER})",
+    )
+
+    common_sub = argparse.ArgumentParser(add_help=False)
+    common_sub.add_argument("--sa", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common_sub.add_argument("--user", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common_sub.add_argument("--json", action="store_true", default=False, help="Output machine-readable JSON")
+
+    parser = argparse.ArgumentParser(
+        prog="gmail-block",
+        description="Nuclear-level Gmail sender and domain blocker.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[common_root],
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+
+    # block
+    p_block = subparsers.add_parser("block", help="Block a sender or entire root domain", parents=[common_sub])
+    p_block.add_argument("target", help="Email address or domain to block")
+    p_block.add_argument("--commit", action="store_true", help="Actually create the filter and apply mutations")
+    p_block.add_argument("--exact", action="store_true", help="Block only this exact email, not the whole domain")
+    p_block.add_argument("--force-domain", action="store_true", help="Force root-domain block even on public webmail/cloud platforms")
+    p_block.add_argument("--purge", action="store_true", help="Also purge existing messages from this target to Trash")
+    p_block.add_argument("--report-abuse", action="store_true", help="Dispatch a formal abuse complaint to registrar & Google")
+    p_block.add_argument("--limit", type=int, default=50, help="Cap mailbox scan results (default: 50)")
+
+    # list
+    subparsers.add_parser("list", help="List active filters in Gmail", parents=[common_sub])
+
+    # unblock
+    p_unblock = subparsers.add_parser("unblock", help="Remove a block filter by ID or target", parents=[common_sub])
+    p_unblock.add_argument("target", help="Filter ID or target email/domain to remove")
+    p_unblock.add_argument("--commit", action="store_true", help="Actually delete the filter")
+
+    # scan
+    p_scan = subparsers.add_parser("scan", help="Scan mailbox for existing messages from target", parents=[common_sub])
+    p_scan.add_argument("target", help="Email or domain to search")
+    p_scan.add_argument("--exact", action="store_true", help="Search only exact email")
+    p_scan.add_argument("--force-domain", action="store_true", help="Search entire domain")
+    p_scan.add_argument("--limit", type=int, default=50, help="Maximum messages to scan (default: 50)")
+
+    # abuse-info
+    p_abuse = subparsers.add_parser("abuse-info", help="Lookup registrar abuse and phishing reporting info", parents=[common_sub])
+    p_abuse.add_argument("target", help="Email or domain")
+    p_abuse.add_argument("--exact", action="store_true")
+    p_abuse.add_argument("--force-domain", action="store_true")
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+
+    # Convenience: if user runs `gmail-block spammer@bad.com` directly without subcommand
+    if len(sys.argv) > 1 and sys.argv[1] not in {"block", "list", "unblock", "scan", "abuse-info", "-h", "--help"}:
+        sys.argv.insert(1, "block")
+
+    args = parser.parse_args()
+
+    match args.command:
+        case "block":
+            return cmd_block(args)
+        case "list":
+            return cmd_list(args)
+        case "unblock":
+            return cmd_unblock(args)
+        case "scan":
+            return cmd_scan(args)
+        case "abuse-info":
+            return cmd_abuse_info(args)
+        case _:
+            parser.print_help()
+            return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

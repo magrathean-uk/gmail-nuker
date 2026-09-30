@@ -1,0 +1,21 @@
+# Local credentials and configuration
+secrets/
+creds/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*service-account*.json
+*oauth*.json
+*credentials*.json
+*token*.json
+*.db
+*.sqlite*
+# Build outputs and local files
+GmailBlock.app/
+.build/
+.swiftpm/
+__pycache__/
+*.pyc
+.DS_Store
