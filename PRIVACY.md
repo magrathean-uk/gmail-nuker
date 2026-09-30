@@ -8,6 +8,8 @@ This notice describes the CLI and macOS source in gmail-nuker, maintained by MAG
 
 The tool reads a service-account JSON key, the delegated mailbox address, target addresses or domains, and Gmail filter and message metadata. Metadata includes message and thread identifiers, From, Subject, Date, List-Unsubscribe, and List-Unsubscribe-Post headers. These fields can contain personal data and unique tracking URLs. The current mailbox scan requests metadata rather than full message bodies.
 
+The packaged app uses the installed 1Password desktop integration and its bundled official CLI to retrieve the selected service-account JSON into process memory for each operation. The key is not embedded in the app, saved to a temporary credential file, or persisted by the app. Its bundled cryptography signs in memory; its bridge does not use the plaintext IMAP fallback. Only mailbox/secret-reference preferences are saved in macOS preferences; a personal build may include those nonsecret identifiers in its bundled configuration.
+
 Access tokens and signed assertions are used in process memory. If the optional cryptography package is unavailable, the OpenSSL signing fallback writes the private key to a temporary file that is scheduled for deletion when the context closes. This is not Keychain storage and is not a guarantee of secure erasure after a crash. Optional IMAP fallback reads a local plaintext app-password file.
 
 CLI output, JSON results, errors, terminal history, and GUI state can reveal targets, subjects, mailbox addresses, identifiers, credential paths, or remote error responses. The tool does not maintain a separate persistent mailbox database. Redirected output, credentials, backups, operating-system diagnostics, and terminal logs remain under your control.
@@ -28,7 +30,7 @@ A dry-run block still authenticates, reads Gmail metadata, and performs DNS/RDAP
 
 ## Retention and controls
 
-Gmail filters remain until removed. API purge labels messages as Trash rather than requesting immediate permanent deletion. Gmail and administrator retention settings govern subsequent retention; IMAP fallback uses Deleted/expunge and may behave differently. Unblocking does not restore messages or undo unsubscribe requests and reports already sent.
+Gmail filters remain until removed. CLI `block --purge` labels messages as Trash. The GUI wipe and CLI `delete --commit` request permanent deletion of selected preview IDs through Gmail batchDelete and verify that those IDs are absent; this cannot be undone from Gmail Trash. Their preflight reads selected messages' From headers to validate the target, including messages in Spam and Trash. This permanent-delete command does not send unsubscribe requests or change filters. Gmail and administrator retention settings govern provider-held records; IMAP fallback for the older Trash purge uses Deleted/expunge and may behave differently. Unblocking does not restore messages or undo unsubscribe requests and reports already sent.
 
 Remove local credentials and saved output when no longer needed; revoke service-account keys, delegation grants, and app passwords through Google as appropriate. Removing this checkout alone does not revoke credentials or delete remote filters. See [operations](docs/operations.md).
 

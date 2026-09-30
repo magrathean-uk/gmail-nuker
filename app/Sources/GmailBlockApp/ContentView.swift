@@ -2,388 +2,224 @@ import SwiftUI
 
 public struct ContentView: View {
     @Bindable var viewModel: BlockViewModel
-    @FocusState private var isFieldFocused: Bool
+    @FocusState private var targetFocused: Bool
+    @State private var showDeletionConfirmation = false
 
-    public init(viewModel: BlockViewModel) {
-        self.viewModel = viewModel
-    }
+    public init(viewModel: BlockViewModel) { self.viewModel = viewModel }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            headerSection
-                .padding(.top, 24)
-                .padding(.horizontal, 28)
-                .padding(.bottom, 20)
-
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "envelope").foregroundStyle(.secondary)
+                Text(viewModel.account.mailbox.isEmpty ? "Choose a Workspace account" : viewModel.account.mailbox)
+                    .font(.subheadline).textSelection(.enabled)
+                Spacer()
+                if viewModel.connectionChecked {
+                    Label("Connected", systemImage: "checkmark.circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 24).padding(.vertical, 16)
             Divider()
-
-            contentSection
-                .padding(28)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            phaseContent
+                .padding(24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            Divider()
+            HStack {
+                Label("Credentials in 1Password", systemImage: "lock")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                SettingsLink { Image(systemName: "gearshape") }
+                    .buttonStyle(.borderless).help("Account Settings")
+                    .accessibilityLabel("Account Settings")
+                    .disabled(viewModel.isBusy)
+            }.padding(.horizontal, 24).padding(.vertical, 12)
         }
-        .frame(minWidth: 540, idealWidth: 580, minHeight: 440, idealHeight: 480)
+        .frame(minWidth: 520, minHeight: 440)
         .background(.background)
-        .onAppear {
-            isFieldFocused = true
+        .onAppear { targetFocused = true }
+        .onChange(of: viewModel.currentPhase) { _, phase in
+            if phase == .input { targetFocused = true }
         }
     }
 
-    // ── Header ───────────────────────────────────────────────────────────────
-
-    private var headerSection: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "shield.slash.fill")
-                .font(.system(size: 32, weight: .bold))
-                .foregroundStyle(.red.gradient)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Gmail Nuclear Blocker")
-                    .font(.title2.weight(.bold))
-                    .foregroundStyle(.primary)
-
-                Text("Root-level domain eradication & automated incoming trash routing")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            if viewModel.isBusy {
-                ProgressView()
-                    .controlSize(.small)
-            }
-        }
-    }
-
-    // ── Dynamic Content ───────────────────────────────────────────────────────
-
-    @ViewBuilder
-    private var contentSection: some View {
+    @ViewBuilder private var phaseContent: some View {
         switch viewModel.currentPhase {
-        case .input:
-            inputView
-
+        case .input: inputView
         case .blocking:
-            statusProgressView(
-                title: "Engaging Nuclear Block",
-                subtitle: "Creating root-level trash filter in Gmail and probing mailbox…"
-            )
-
-        case .blockedPromptWipe(let result):
-            blockedPromptWipeView(result: result)
-
+            progress("Blocking Sender", detail: "Approve 1Password if prompted. Creating the filter and finding matching mail…")
+        case .checking:
+            progress("Connecting to Gmail", detail: "Approve 1Password if prompted. Checking access to your mailbox…")
+        case .blockedPromptWipe(let result): preview(result)
         case .purging:
-            statusProgressView(
-                title: "Wiping Previous Emails",
-                subtitle: "Purging previous messages from mailbox to Trash…"
-            )
-
-        case .finished(let result, let wasPurged):
-            finishedView(result: result, wasPurged: wasPurged)
-
+            progress("Deleting Messages", detail: "Permanently deleting the confirmed messages and verifying their removal…")
+        case .finished(let result, let deleted): finished(result, deleted: deleted)
         case .error(let message):
-            errorView(message: message)
+            VStack(alignment: .leading, spacing: 16) {
+                Label("Couldn’t Complete the Request", systemImage: "exclamationmark.circle")
+                    .font(.title3.weight(.semibold))
+                Text(message).foregroundStyle(.secondary).textSelection(.enabled)
+                Spacer()
+                HStack {
+                    SettingsLink { Text("Account Settings…") }
+                    Spacer()
+                    Button("Try Again") { viewModel.reset() }.keyboardShortcut(.defaultAction)
+                }
+            }
         }
     }
-
-    // ── 1. Input View ─────────────────────────────────────────────────────────
 
     private var inputView: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Target Address or Domain")
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-
-                Text("Enter a spammer email address (e.g. user@spam.com) or root domain. Corporate domains are blocked at the root apex level.")
-                    .font(.subheadline)
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Block Unwanted Mail").font(.title2.weight(.semibold))
+                Text("Send future mail from a sender or domain to Trash.")
                     .foregroundStyle(.secondary)
             }
-
-            HStack(spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "envelope.badge.shield.half.filled")
-                        .foregroundStyle(.secondary)
-
-                    TextField("Paste email or domain here…", text: $viewModel.targetText)
-                        .textFieldStyle(.plain)
-                        .font(.body)
-                        .focused($isFieldFocused)
-                        .onSubmit {
-                            Task {
-                                await viewModel.submitBlock()
-                            }
-                        }
-
-                    if !viewModel.targetText.isEmpty {
-                        Button {
-                            viewModel.targetText = ""
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color(nsColor: .controlBackgroundColor))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-                )
-
-                Button {
-                    Task {
-                        await viewModel.submitBlock()
-                    }
-                } label: {
-                    Label("Block Target", systemImage: "bolt.shield.fill")
-                        .fontWeight(.semibold)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.red)
-                .controlSize(.large)
-                .disabled(viewModel.targetText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isBusy)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.shield")
-                        .foregroundStyle(.green)
-                    Text("Auto-routed directly to Trash permanently (auto-purged)")
-                }
-                HStack(spacing: 6) {
-                    Image(systemName: "bell.slash")
-                        .foregroundStyle(.blue)
-                    Text("Bypasses Inbox and strips Unread / Priority notifications")
-                }
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .padding(.top, 4)
-
-            Spacer()
-        }
-    }
-
-    // ── 2. Progress View ──────────────────────────────────────────────────────
-
-    private func statusProgressView(title: String, subtitle: String) -> some View {
-        VStack(spacing: 16) {
-            Spacer()
-            ProgressView()
-                .controlSize(.large)
-
-            Text(title)
-                .font(.headline)
-
-            Text(subtitle)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Spacer()
-        }
-    }
-
-    // ── 3. Blocked Confirmation & Wipe Prompt View ────────────────────────────
-
-    private func blockedPromptWipeView(result: BlockResult) -> some View {
-        let domain = result.target?.root_domain ?? "Target"
-        let messages = result.found_messages ?? []
-
-        return VStack(alignment: .leading, spacing: 18) {
-            // Block Success Banner
-            HStack(spacing: 12) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.title)
-                    .foregroundStyle(.green)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Root-Level Block Active: \(domain)")
-                        .font(.headline.weight(.bold))
-                    Text("Any incoming email from this domain will be destroyed immediately into Trash.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.green.opacity(0.12))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.green.opacity(0.3), lineWidth: 1)
-            )
-
-            // Wipe Decision
-            if !messages.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Text("Previous Emails Found (\(messages.count))")
-                            .font(.headline)
-
-                        Spacer()
-
-                        Text("Wipe them too?")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    ScrollView {
-                        VStack(spacing: 8) {
-                            ForEach(messages) { msg in
-                                HStack(alignment: .top, spacing: 10) {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(msg.subject.isEmpty ? "(No Subject)" : msg.subject)
-                                            .font(.subheadline.weight(.medium))
-                                            .lineLimit(1)
-
-                                        HStack(spacing: 8) {
-                                            Text(msg.from)
-                                                .lineLimit(1)
-                                            Text("•")
-                                            Text(msg.date.prefix(25))
-                                        }
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    }
-
-                                    Spacer()
-
-                                    Image(systemName: "envelope.fill")
-                                        .foregroundStyle(.secondary.opacity(0.6))
-                                }
-                                .padding(10)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(Color(nsColor: .controlBackgroundColor))
-                                )
-                            }
-                        }
-                    }
-                    .frame(maxHeight: 160)
-
-                    HStack(spacing: 12) {
-                        Button {
-                            Task {
-                                await viewModel.wipePrevious(result: result)
-                            }
-                        } label: {
-                            Label("Yes, Wipe All \(messages.count) Emails", systemImage: "trash.fill")
-                                .fontWeight(.semibold)
-                        }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Email address or domain").font(.subheadline.weight(.medium))
+                HStack(spacing: 10) {
+                    TextField("sender@example.com", text: $viewModel.targetText)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($targetFocused)
+                        .onSubmit { if canBlock { Task { await viewModel.submitBlock() } } }
+                        .accessibilityLabel("Email address or domain")
+                    Button("Block") { Task { await viewModel.submitBlock() } }
                         .buttonStyle(.borderedProminent)
-                        .tint(.red)
-                        .controlSize(.large)
+                        .keyboardShortcut(.defaultAction).disabled(!canBlock)
+                }.controlSize(.large)
+            }
+            Text("Company addresses block the whole domain. Shared email providers use the exact address. Blocking also attempts supported unsubscribe requests.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            if !viewModel.account.isConfigured {
+                SettingsLink { Text("Set Up Account…") }.buttonStyle(.borderedProminent)
+            }
+        }
+    }
 
-                        Button {
-                            viewModel.keepPrevious(result: result)
-                        } label: {
-                            Text("No, Keep Previous")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.large)
-                    }
-                    .padding(.top, 4)
-                }
+    private var canBlock: Bool {
+        !viewModel.targetText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && viewModel.account.isConfigured && !viewModel.isBusy
+    }
+
+    private func progress(_ title: String, detail: String) -> some View {
+        VStack(spacing: 14) {
+            ProgressView().controlSize(.regular)
+            Text(title).font(.headline)
+            Text(detail).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                .frame(maxWidth: 360)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func targetName(_ result: BlockResult) -> String {
+        guard let target = result.target else { return viewModel.targetText }
+        return target.block_mode == "exact" ? (target.email ?? target.host) : target.root_domain
+    }
+
+    private func preview(_ result: BlockResult) -> some View {
+        let messages = result.found_messages ?? []
+        let target = targetName(result)
+        return VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Label(result.already_active == true ? "Sender Already Blocked" : "Sender Blocked", systemImage: "checkmark.circle")
+                    .font(.title3.weight(.semibold))
+                Text("Future mail from \(target) goes to Trash.")
+                    .foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            if messages.isEmpty {
+                ContentUnavailableView("No Matching Mail", systemImage: "tray", description: Text("No existing messages were found in this search."))
             } else {
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("No previous emails from this sender were found in your mailbox.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-
-                    Button {
-                        viewModel.reset()
-                    } label: {
-                        Text("Block Another Target")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
+                HStack {
+                    Text("\(messages.count) matching \(messages.count == 1 ? "message" : "messages")").font(.headline)
+                    Spacer()
+                    Text("Includes Spam & Trash").font(.caption).foregroundStyle(.secondary)
                 }
-                .padding(.top, 10)
+                List(messages) { message in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(message.subject.isEmpty ? "(No Subject)" : message.subject)
+                            .font(.body.weight(.medium)).lineLimit(2)
+                        HStack {
+                            Text(message.from).lineLimit(1)
+                            Spacer()
+                            Text(message.date).lineLimit(1)
+                        }.font(.caption).foregroundStyle(.secondary)
+                    }.padding(.vertical, 4)
+                }
+                .listStyle(.inset).frame(minHeight: 100)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                Text("This preview shows up to 50 messages. Delete affects only the messages shown.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-
-            Spacer()
+            if let error = viewModel.operationError {
+                Label(error, systemImage: "exclamationmark.circle")
+                    .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            Spacer(minLength: 0)
+            HStack {
+                Button(messages.isEmpty ? "Done" : "Keep Messages") { viewModel.keepPrevious(result: result) }
+                    .keyboardShortcut(.defaultAction)
+                Spacer()
+                if !messages.isEmpty {
+                    Button("Delete Permanently…", role: .destructive) { showDeletionConfirmation = true }
+                }
+            }
+        }
+        .alert("Delete \(messages.count) \(messages.count == 1 ? "Message" : "Messages") Permanently?", isPresented: $showDeletionConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete Permanently", role: .destructive) { Task { await viewModel.wipePrevious(result: result) } }
+        } message: {
+            Text("The \(messages.count) \(messages.count == 1 ? "message" : "messages") shown for \(target) will be permanently deleted from Gmail. This can’t be undone.")
         }
     }
 
-    // ── 4. Finished / Confirmation View ───────────────────────────────────────
+    private func finished(_ result: BlockResult, deleted: Bool) -> some View {
+        VStack(spacing: 14) {
+            Image(systemName: "checkmark.circle").font(.system(size: 40)).foregroundStyle(.tint)
+            Text(deleted ? "Messages Deleted" : "Sender Blocked").font(.title2.weight(.semibold))
+            if deleted {
+                Text("\(result.deleted_permanently ?? 0) permanently deleted · \(result.already_missing ?? 0) already absent")
+                    .foregroundStyle(.secondary)
+                Text("Removal verified in Gmail.").font(.callout).foregroundStyle(.secondary)
+            } else {
+                Text("Existing messages were kept.").foregroundStyle(.secondary)
+            }
+            Text("Future mail from \(targetName(result)) goes to Trash.")
+                .foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Button("Block Another Sender") { viewModel.reset() }
+                .keyboardShortcut(.defaultAction).padding(.top, 8)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
 
-    private func finishedView(result: BlockResult, wasPurged: Bool) -> some View {
-        let domain = result.target?.root_domain ?? "Target"
+struct AccountSettingsView: View {
+    @Bindable var viewModel: BlockViewModel
+    @State private var mailbox = AccountConfiguration.load().mailbox
+    @State private var secretReference = AccountConfiguration.load().secretReference
 
-        return VStack(spacing: 20) {
-            Spacer()
-
-            Image(systemName: wasPurged ? "trash.circle.fill" : "shield.lefthalf.filled.badge.checkmark")
-                .font(.system(size: 56))
-                .foregroundStyle(wasPurged ? .red : .blue)
-
-            VStack(spacing: 6) {
-                Text(wasPurged ? "Wipe Complete & Domain Blocked" : "Root Block Confirmed")
-                    .font(.title2.weight(.bold))
-
-                if wasPurged {
-                    Text("Successfully trashed previous emails. Any new incoming emails from \(domain) will be incinerated into Trash.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 20)
-                } else {
-                    Text("Previous emails preserved. Any new incoming emails from \(domain) will be incinerated into Trash.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 20)
+    var body: some View {
+        Form {
+            Section("Google Workspace") {
+                TextField("Email address", text: $mailbox)
+                TextField("1Password field", text: $secretReference)
+                Text("Use the secret reference for the field containing your service-account JSON, such as op://Vault/Item/credential. Your key stays in 1Password.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Text("Keep 1Password installed and enable Settings → Developer → Integrate with 1Password CLI.")
+                    .font(.callout).foregroundStyle(.secondary)
+                Button("Save & Check Connection") {
+                    UserDefaults.standard.set(mailbox.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "mailbox")
+                    UserDefaults.standard.set(secretReference.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "secretReference")
+                    viewModel.refreshAccount()
+                    Task { await viewModel.checkConnection() }
+                }.disabled(viewModel.isBusy)
+                if viewModel.isBusy { ProgressView().controlSize(.small) }
+                if viewModel.connectionChecked { Label("Connected to Gmail", systemImage: "checkmark.circle") }
+                if case .error(let message) = viewModel.currentPhase {
+                    Text(message).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
                 }
             }
-
-            Button {
-                viewModel.reset()
-                isFieldFocused = true
-            } label: {
-                Label("Block Another Target", systemImage: "plus")
-                    .fontWeight(.medium)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-
-            Spacer()
-        }
-    }
-
-    // ── 5. Error View ─────────────────────────────────────────────────────────
-
-    private func errorView(message: String) -> some View {
-        VStack(spacing: 16) {
-            Spacer()
-
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 48))
-                .foregroundStyle(.yellow)
-
-            Text("Operation Encountered an Issue")
-                .font(.headline)
-
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 20)
-
-            Button("Try Again") {
-                viewModel.reset()
-                isFieldFocused = true
-            }
-            .buttonStyle(.borderedProminent)
-
-            Spacer()
-        }
+        }.formStyle(.grouped).padding(12).frame(width: 480, height: 390)
     }
 }

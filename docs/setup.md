@@ -33,6 +33,8 @@ The current engine requests these scopes as a bundle:
 
 Each suffix is prefixed with `https://www.googleapis.com/auth/`. If the full bundle is rejected with unauthorized_client, the engine retries without gmail.modify. It still requests gmail.send, even for read-only commands. It does not negotiate the least possible scope for each command.
 
+Permanent deletion additionally requires **https://mail.google.com/** in the Workspace delegation. The GUI wipe and CLI `delete --commit` request it explicitly and fail if it is unavailable; they do not fall back to Trash or IMAP. Ordinary block/list commands keep their existing scope bundle.
+
 ```bash
 export GMAIL_BLOCK_SA="/absolute/path/to/service-account.json"
 export GMAIL_BLOCK_USER="you@example.com"
@@ -54,13 +56,19 @@ This is a description of the expected format, not a credential file to commit. T
 
 ## Build and launch the app
 
+Building requires macOS, Swift 6.4, `uv`, and the official 1Password CLI. The builder creates an Apple silicon app and ZIP in ignored `dist/`. It bundles Python 3.14, cryptography, certifi, and a copy of the installed 1Password CLI with its vendor signature preserved. The current package was tested on macOS 26.7.1; macOS 14 is its deployment target, not a verified test platform.
+
 ```bash
-cd app
-swift build -c release
-cd ..
-./run.sh
+python3 scripts/package-app.py
+open "dist/Gmail Nuker.app"
 ```
 
-Run from the checkout root with configuration exported in the launching shell. When no app bundle exists, run.sh launches app/.build/release/GmailBlockApp. The app first checks for bin/gmail-block beside a bundle, then under its working directory. Homebrew Python at /opt/homebrew/bin/python3 is preferred; otherwise the executable's env python3 uses the available PATH.
+Open Account Settings, enter the delegated Workspace address and an `op://Vault/Item/credential` secret reference. The field must contain the complete service-account JSON. Enable **1Password Settings → Developer → Integrate with 1Password CLI**, keep 1Password installed, and approve its access request. **Save & Check Connection** reads the Gmail profile without creating filters, deleting messages, sending, or unsubscribing.
 
-The repository provides source, not a signed/notarised app installer. Configuration is not an interactive GUI login. The GUI submits committed blocks immediately and asks separately whether to purge prior mail.
+For a personal preconfigured build, create a nonsecret JSON file outside the checkout and pass `--config /path/to/account.json`. It contains only `mailbox`, `secretReference`, and `serviceAccount` strings. An optional `opConfigDirectory` preserves an existing custom 1Password CLI configuration directory; `~` is expanded at runtime. Never put the private-key JSON into this configuration. A personal bundle may identify your mailbox and vault item, so review it before sharing.
+
+The app and ZIP contain no service-account key. The bridge fetches it from 1Password into memory for each operation, signs in memory using bundled cryptography, and exits when that operation completes. The package does not use the plaintext IMAP fallback. Native Settings stores only the mailbox and field reference in macOS preferences. Quit is disabled during an active operation so closing the application does not interrupt a permanent deletion.
+
+The initial **Block** action commits a filter and can attempt unsubscribe requests. It then previews up to 50 messages, including Spam and Trash. **Delete Permanently…** requires a separate confirmation and acts only on that preview. A deletion failure retains the preview and active block so the same IDs can be retried.
+
+These are local ad-hoc signed bundles, without Developer ID notarisation, automated updates, or an App Store distribution. The CLI remains available independently. A raw `swift build -c release` executable is useful for source/UI development and keeps its external engine/file-credential fallback; Finder use and built-in 1Password access require the packaged app.

@@ -6,3 +6,7 @@ Gmail and Google Workspace are trademarks of Google. This project is independent
 Runtime components are not bundled in this source repository: Python and its standard library, Swift/SwiftUI/Foundation, OpenSSL when used for signing, the host DNS tools, and optional Python cryptography. These components remain subject to their own licences. Installing them does not transfer their copyrights to this project.
 
 No third-party vendored library or dataset was identified in the initial source-only checkout. Maintainers must review provenance and update this notice when adding third-party material.
+
+Local app packaging bundles Python, cryptography, certifi and a PyInstaller bootloader. Their notices and exact runtime versions are copied into Contents/Resources/Licenses at build time. PyInstaller is GPL-licensed with a bootloader exception; cryptography includes Apache/BSD terms and a statically linked OpenSSL implementation covered by its supplied notices; certifi supplies a Mozilla-derived trust store. Review the copied notices before redistributing.
+
+A personal local build also copies the installed official 1Password CLI and preserves its vendor signature. It is third-party software owned by 1Password, not a library licensed by this project. It requires the operator's installed 1Password app/account and is governed by 1Password's terms. The source repository does not vendor the helper or grant redistribution rights.

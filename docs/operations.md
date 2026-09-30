@@ -12,6 +12,14 @@ List filters and check the Gmail settings interface. Inspect Trash and Inbox wit
 
 For complaints, review the generated wording and discovered recipients before using --report-abuse. There is no separate preview/send workflow for the final generated email. The implementation cannot verify its allegations or attribute the sending infrastructure from MX records.
 
+## Permanently delete previous mail
+
+The GUI includes Trash and Spam in its bounded preview. Choose Delete Permanently, review the confirmation's target and count, then confirm. Only the listed IDs are deleted. Incoming mail continues to be routed to Trash; the filter does not automatically permanently delete future arrivals.
+
+For CLI use, get IDs from a JSON block preview with `--include-spam-trash`, then run `delete TARGET --message-id ID` (repeat the flag per selected ID). This is read-only until `--commit` is added. Use the same `--exact` or `--force-domain` mode as the reviewed preview. The committed command checks senders before deletion and verifies selected IDs are absent afterward. It has no unsubscribe or IMAP fallback.
+
+Permanent deletion cannot be undone from Gmail Trash. In the GUI, a failed deletion retains the preview and active block so the same IDs can be retried. A failed verification reports an error rather than wipe complete; some selected messages may already have been deleted before a provider error. Rerun a read-only preview to inspect remaining mail. Already absent selected IDs are reported separately from newly deleted messages. The scan limit still applies; the result is not a claim about unlisted historical mail.
+
 ## Undo a filter
 
 ```bash

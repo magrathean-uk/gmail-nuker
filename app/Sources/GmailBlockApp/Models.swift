@@ -29,6 +29,9 @@ public struct BlockResult: Sendable, Codable, Equatable {
     public let found_messages: [FoundMessage]?
     public let purged: Int?
     public let remaining: Int?
+    public let deleted_permanently: Int?
+    public let already_missing: Int?
+    public let delete_verified: Bool?
     public let abuse_emails: [String]?
     public let registrar: String?
     public let safe_browsing_url: String?

@@ -336,20 +336,26 @@ def _sign_assertion(creds: dict[str, Any], subject: str, scopes: list[str]) -> s
     return f"{si}.{_b64url(sig)}"
 
 
-def get_sa_token(sa_path: Path | str, subject: str) -> tuple[str, bool]:
+def get_sa_token(sa_path: Path | str | dict[str, Any], subject: str, *, permanent_delete: bool = False) -> tuple[str, bool]:
     """
     Acquires OAuth access token.
     Attempts full scopes (with gmail.modify). If Domain-Wide Delegation in Google
     Admin Console is scoped only to base scopes, gracefully falls back to BASE_SCOPES.
     Returns (access_token, has_modify_scope).
     """
-    path = Path(sa_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Service account file not found: {path}")
-    creds = json.loads(path.read_text(encoding="utf-8"))
+    # The packaged app supplies the 1Password credential in memory. CLI callers
+    # retain the existing file interface; no key is written by the app wrapper.
+    if isinstance(sa_path, dict):
+        creds = sa_path
+    else:
+        path = Path(sa_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Service account file not found: {path}")
+        creds = json.loads(path.read_text(encoding="utf-8"))
 
-    # Try full scopes first
-    for scopes, has_modify in [(FULL_SCOPES, True), (BASE_SCOPES, False)]:
+    # Permanent deletion requires full mail scope and must never fall back to Trash.
+    candidates = [([*FULL_SCOPES, "https://mail.google.com/"], True)] if permanent_delete else [(FULL_SCOPES, True), (BASE_SCOPES, False)]
+    for scopes, has_modify in candidates:
         assertion = _sign_assertion(creds, subject, scopes)
         data = urllib.parse.urlencode(
             {
@@ -365,13 +371,19 @@ def get_sa_token(sa_path: Path | str, subject: str) -> tuple[str, bool]:
         except urllib.error.HTTPError as e:
             err_body = e.read().decode(errors="replace")
             # If unauthorized for requested scope, try fallback
-            if "unauthorized_client" in err_body and has_modify:
+            if "unauthorized_client" in err_body and has_modify and not permanent_delete:
                 continue
             raise RuntimeError(f"OAuth token error ({e.code}): {err_body}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"OAuth connection failed: {e.reason}") from e
 
     raise RuntimeError("Failed to acquire OAuth token with available scopes.")
+
+
+class GmailAPIError(RuntimeError):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
 
 
 def api_call(
@@ -403,7 +415,7 @@ def api_call(
             if e.code in {429, 500, 503} and attempt < max_retries - 1:
                 time.sleep(2 ** attempt + 0.5)
                 continue
-            raise RuntimeError(f"Gmail API HTTP {e.code} for {method} {url}:\n{body_text}") from e
+            raise GmailAPIError(e.code, f"Gmail API HTTP {e.code} for {method} {url}:\n{body_text}") from e
         except urllib.error.URLError as e:
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt + 0.5)
@@ -550,8 +562,10 @@ def delete_filter(token: str, filter_id: str) -> None:
 
 # ── Mailbox Message Operations ───────────────────────────────────────────────
 
-def search_mailbox(token: str, query: str, limit: int = 50) -> list[dict[str, Any]]:
+def search_mailbox(token: str, query: str, limit: int = 50, *, include_spam_trash: bool = False) -> list[dict[str, Any]]:
     url_path = f"users/me/messages?q={urllib.parse.quote(query)}&maxResults={min(limit, 500)}"
+    if include_spam_trash:
+        url_path += "&includeSpamTrash=true"
     data = api_call(token, url_path)
     messages = data.get("messages", [])
     results: list[dict[str, Any]] = []
@@ -575,6 +589,7 @@ def search_mailbox(token: str, query: str, limit: int = 50) -> list[dict[str, An
                     "date": headers.get("date", ""),
                     "list_unsubscribe": headers.get("list-unsubscribe", ""),
                     "list_unsubscribe_post": headers.get("list-unsubscribe-post", ""),
+                    "in_spam_trash": bool({"SPAM", "TRASH"}.intersection(detail.get("labelIds", []))),
                 }
             )
         except Exception:
@@ -762,7 +777,7 @@ def cmd_block(args: argparse.Namespace) -> int:
     log(f"Public Provider      : {'YES (Multi-tenant webmail)' if target.is_public_provider else ('YES (Shared Cloud Platform)' if target.is_multi_tenant_platform else 'No (Custom Domain)')}")
     log(f"Block Mode           : {target.block_mode.upper()} {'[BRUTAL ROOT DOMAIN ERADICATION]' if target.block_mode == 'root_domain' else '[EXACT ADDRESS / SUBDOMAIN ONLY]'}")
     log(f"Incoming Filter Spec : {target.filter_criteria}")
-    log(f"Action When Received : TRASH IMMEDIATELY (Purged permanently, bypasses Inbox, stripped Unread/Important)")
+    log("Action When Received : Move to Trash; remove Inbox, Unread and Important")
     log()
 
     # Authenticate
@@ -804,7 +819,8 @@ def cmd_block(args: argparse.Namespace) -> int:
 
     # 2. Mailbox scan
     log(f"[2/4] Scanning mailbox for previous messages ({target.search_query}) …")
-    found_messages = search_mailbox(token, target.search_query, limit=args.limit)
+    found_messages = search_mailbox(token, target.search_query, limit=args.limit,
+                                    include_spam_trash=getattr(args, "include_spam_trash", False))
     log(f"  Found {len(found_messages)} previous message(s) in mailbox.")
     for idx, m in enumerate(found_messages[:5], 1):
         unsub_note = " [Unsub Header Available]" if m["list_unsubscribe"] else ""
@@ -872,7 +888,7 @@ def cmd_block(args: argparse.Namespace) -> int:
     log("=" * 70)
 
     # Trigger one-click unsubscribe on existing messages first if available
-    unsub_msgs = [m for m in found_messages if m.get("list_unsubscribe")]
+    unsub_msgs = [m for m in found_messages if m.get("list_unsubscribe") and not m.get("in_spam_trash", False)]
     if unsub_msgs:
         log(f"[+] Triggering automated One-Click Unsubscribe strike on {len(unsub_msgs)} message(s) …")
         res = trigger_one_click_unsubscribe(token, args.user, unsub_msgs[0])
@@ -989,6 +1005,81 @@ def cmd_block(args: argparse.Namespace) -> int:
 
     return 0
 
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    """Permanently delete only explicitly selected, revalidated preview IDs."""
+    ids = list(dict.fromkeys(args.message_id))
+    result: dict[str, Any] = {"success": False, "committed": bool(args.commit),
+                              "deleted_permanently": 0, "already_missing": 0,
+                              "delete_verified": False}
+    try:
+        if not ids or len(ids) > 500 or any(not re.fullmatch(r"[A-Za-z0-9_-]+", mid) for mid in ids):
+            raise ValueError("Select between 1 and 500 valid preview message IDs.")
+        target = parse_target(args.target, exact=args.exact, force_domain=args.force_domain)
+        result["target"] = {"raw": target.raw, "email": target.email_address, "host": target.host,
+                            "root_domain": target.root_domain, "block_mode": target.block_mode,
+                            "is_public_provider": target.is_public_provider,
+                            "is_multi_tenant_platform": target.is_multi_tenant_platform}
+        try:
+            token, _ = get_sa_token(args.sa, args.user, permanent_delete=bool(args.commit))
+        except Exception as error:
+            if args.commit:
+                raise RuntimeError("Permanent deletion requires Workspace delegation for https://mail.google.com/. Authentication failed: " + str(error)) from error
+            raise
+
+        def read_message(mid: str) -> dict[str, Any] | None:
+            try:
+                return api_call(token, f"users/me/messages/{mid}?format=metadata&metadataHeaders=From&fields=id,payload(headers)")
+            except GmailAPIError as error:
+                if error.status == 404:
+                    return None
+                raise
+
+        selected = []
+        # Validate every selected message before issuing any irreversible request.
+        for mid in ids:
+            message = read_message(mid)
+            if message is None:
+                result["already_missing"] += 1
+                continue
+            from_headers = [h.get("value", "") for h in message.get("payload", {}).get("headers", [])
+                            if h.get("name", "").lower() == "from"]
+            addresses = email.utils.getaddresses(from_headers)
+            if len(addresses) != 1 or "@" not in addresses[0][1]:
+                raise ValueError("A selected message has an ambiguous sender. Nothing was deleted.")
+            sender = addresses[0][1].lower()
+            host = to_punycode(sender.rsplit("@", 1)[1].strip("."))
+            if target.block_mode == "exact":
+                matches = sender == target.email_address if target.email_address else host == target.ascii_host
+            else:
+                matches = host == target.ascii_root_domain or host.endswith("." + target.ascii_root_domain)
+            if not matches:
+                raise ValueError("A selected message does not belong to the confirmed target. Nothing was deleted.")
+            selected.append(mid)
+        if not args.commit:
+            result.update(success=True, selected_count=len(selected), remaining=len(selected))
+        else:
+            if selected:
+                api_call(token, "users/me/messages/batchDelete", method="POST", body={"ids": selected})
+            # An empty batchDelete response alone is not proof of deletion.
+            remaining = sum(read_message(mid) is not None for mid in ids)
+            result.update(remaining=remaining, deleted_permanently=max(0, len(selected) - remaining),
+                          delete_verified=remaining == 0, success=remaining == 0)
+            if remaining:
+                result["error"] = f"Permanent deletion could not be verified: {remaining} selected message(s) are still present."
+    except Exception as error:
+        result["error"] = str(error)
+    if args.json:
+        print(json.dumps(result))
+    elif result["success"]:
+        if args.commit:
+            print(f"Permanently deleted {result['deleted_permanently']} selected message(s); {result['already_missing']} were already absent. Verified remaining: {result['remaining']}.")
+        else:
+            print(f"Preview only: {result['selected_count']} selected message(s) would be permanently deleted. Re-run with --commit to confirm.")
+    else:
+        print(result["error"], file=sys.stderr)
+    return 0 if result["success"] else 1
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -1161,6 +1252,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_block.add_argument("--purge", action="store_true", help="Also purge existing messages from this target to Trash")
     p_block.add_argument("--report-abuse", action="store_true", help="Dispatch a formal abuse complaint to registrar & Google")
     p_block.add_argument("--limit", type=int, default=50, help="Cap mailbox scan results (default: 50)")
+    p_block.add_argument("--include-spam-trash", action="store_true", help="Include Spam and Trash in the message preview")
+
+    p_delete = subparsers.add_parser("delete", help="Permanently delete selected preview message IDs", parents=[common_sub])
+    p_delete.add_argument("target", help="Confirmed sender or domain; every selected ID is checked against it")
+    p_delete.add_argument("--message-id", action="append", required=True, help="Selected preview ID; repeat for each message")
+    p_delete.add_argument("--commit", action="store_true", help="Confirm irreversible permanent deletion; no Trash recovery")
+    p_delete.add_argument("--exact", action="store_true")
+    p_delete.add_argument("--force-domain", action="store_true")
 
     # list
     subparsers.add_parser("list", help="List active filters in Gmail", parents=[common_sub])
@@ -1190,7 +1289,7 @@ def main() -> int:
     parser = build_parser()
 
     # Convenience: if user runs `gmail-block spammer@bad.com` directly without subcommand
-    if len(sys.argv) > 1 and sys.argv[1] not in {"block", "list", "unblock", "scan", "abuse-info", "-h", "--help"}:
+    if len(sys.argv) > 1 and sys.argv[1] not in {"block", "delete", "list", "unblock", "scan", "abuse-info", "-h", "--help"}:
         sys.argv.insert(1, "block")
 
     args = parser.parse_args()
@@ -1198,6 +1297,8 @@ def main() -> int:
     match args.command:
         case "block":
             return cmd_block(args)
+        case "delete":
+            return cmd_delete(args)
         case "list":
             return cmd_list(args)
         case "unblock":

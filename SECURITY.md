@@ -20,6 +20,6 @@ Mail headers, domains, MX records, and RDAP responses are untrusted inputs. The 
 
 Committed block operations automatically process unsubscribe headers. Their URLs may be attacker-controlled and may identify the recipient; the client can follow redirects. Run only in an environment where these requests are acceptable. The tool is not a network sandbox.
 
-The OpenSSL fallback temporarily writes a private key to disk. IMAP fallback reads plaintext app-password credentials and expunges messages. Domain matching uses maintained lists and a suffix heuristic rather than a complete current Public Suffix List. The GUI and CLI can show optimistic success despite partial failures. See [limitations](docs/limitations.md) and [privacy](PRIVACY.md).
+The OpenSSL fallback temporarily writes a private key to disk. IMAP fallback reads plaintext app-password credentials and expunges messages. Domain matching uses maintained lists and a suffix heuristic rather than a complete current Public Suffix List. The block flow can show optimistic success despite partial failures. Permanent deletion separately verifies the selected message IDs; packaged authentication errors are surfaced and deletion failures preserve the preview for retry. See [limitations](docs/limitations.md) and [privacy](PRIVACY.md).
 
 For accidental credential exposure, revoke the affected key or app password and delegation as appropriate before cleaning public history. Deleting the file in a later commit does not remove it from earlier commits or clones.

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_BUNDLE="${SCRIPT_DIR}/GmailBlock.app"
+APP_BUNDLE="${SCRIPT_DIR}/dist/Gmail Nuker.app"
 
 if [ -d "${APP_BUNDLE}" ]; then
     open "${APP_BUNDLE}"
