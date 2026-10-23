@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Update the packaged Python runtime to cryptography 50.0.2 and certifi 2026.10.19.
+
 - Add local Apple silicon app/ZIP packaging with a bundled engine/runtime and official 1Password helper. Retrieve keys only into process memory; add account Settings and a read-only connection check. Simplify the native UI, enable window resizing and keyboard shortcuts, drain subprocess output concurrently, and preserve deletion previews on failure.
 
 - Make the macOS wipe permanently delete the confirmed preview messages, including mail in Trash/Spam. Add irreversible-deletion confirmation, sender/ID checks, full-mail authorization without fallback, and per-message removal verification. Add a separate CLI delete command and synthetic boundary tests. Future incoming mail still goes to Trash.
