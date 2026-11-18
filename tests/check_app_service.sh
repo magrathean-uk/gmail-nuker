@@ -6,6 +6,7 @@ trap 'rm -rf "$test_dir"' EXIT
 swiftc -swift-version 6 \
   "$repo_dir/app/Sources/GmailBlockApp/Models.swift" \
   "$repo_dir/app/Sources/GmailBlockApp/AccountConfiguration.swift" \
+  "$repo_dir/app/Sources/GmailBlockApp/KeychainStore.swift" \
   "$repo_dir/app/Sources/GmailBlockApp/BlockService.swift" \
   "$repo_dir/tests/ServiceChecks.swift" \
   -o "$test_dir/service-checks"

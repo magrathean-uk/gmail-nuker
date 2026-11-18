@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add a choice of where the Google key lives: the macOS login Keychain (new default, no prompts) or 1Password. Settings can import a JSON file, copy from 1Password or remove the key; the CLI accepts `--sa keychain`. The Keychain item is readable by processes running as the user while the keychain is unlocked; 1Password still asks each time.
+- Add a Mail.app integration (`scripts/mail-integration/`) that blocks the selected sender via the installed app, now bundled in the app and Keychain-aware.
+
 - Update the packaged Python runtime to cryptography 50.0.2 and certifi 2026.10.19.
 
 - Add local Apple silicon app/ZIP packaging with a bundled engine/runtime and official 1Password helper. Retrieve keys only into process memory; add account Settings and a read-only connection check. Simplify the native UI, enable window resizing and keyboard shortcuts, drain subprocess output concurrently, and preserve deletion previews on failure.

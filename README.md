@@ -6,6 +6,8 @@ Creates Gmail filters that send matching messages to Trash and remove Inbox, unr
 
 ## Configuration
 
+CLI users can pass `--sa keychain` (or set `GMAIL_BLOCK_SA=keychain`) to use the key stored by the app in the macOS login Keychain instead of a file path.
+
 Credentials are deliberately excluded from this repository. Supply your own Google Workspace service account with domain-wide delegation and appropriate Gmail scopes. The current authentication flow uses a delegated service account; ordinary consumer Gmail OAuth setup is not implemented.
 
 ```bash
@@ -37,14 +39,14 @@ The default target command analyzes the target and inventories matching mail. `-
 
 ## macOS app
 
-Runs on Apple silicon Macs with macOS 14+. Building requires Swift 6.4, `uv`, and the official 1Password CLI.
+Runs on Apple silicon Macs with macOS 14+. Building requires Swift 6.4, `uv`, and the official 1Password CLI (bundled for the optional 1Password key source).
 
 ```bash
 python3 scripts/package-app.py
 open "dist/Gmail Nuker.app"
 ```
 
-The app bundles its Python engine/runtime, cryptography, certificate trust store and 1Password helper. It launches from Finder without a checkout or Terminal environment. In Account Settings, enter your Workspace mailbox and the 1Password secret reference for the field containing your service-account JSON. The key is fetched into process memory per operation and is never embedded in the app or archive.
+The app bundles its Python engine/runtime, cryptography, certificate trust store and 1Password helper. It launches from Finder without a checkout or Terminal environment. In Account Settings, enter your Workspace mailbox and choose where the Google key lives: **This Mac (Keychain)**, the default, or **1Password**. For the Keychain, import the service-account JSON file once (then delete the downloaded file) or copy it from 1Password. For 1Password, enter the secret reference for the field containing the JSON. Either way the key is read into process memory per operation and is never embedded in the app or archive. A Keychain key is readable without a prompt by any program running as you through `/usr/bin/security` while your login keychain is unlocked; 1Password asks for approval each time.
 
 The UI uses standard macOS controls, a resizable window, keyboard shortcuts, a bounded message preview, and a separate permanent-delete confirmation. Settings includes a read-only connection check. Local bundles use ad-hoc signing; this is not a notarised public release. See [setup](docs/setup.md) for personal configuration and packaging details. Compiled apps and archives remain excluded from source control.
 

@@ -60,6 +60,9 @@ DEFAULT_SA_PATH = Path(
         "secrets/service-account.json",
     )
 )
+KEYCHAIN_SERVICE = "uk.magrathean.gmail-nuker"
+KEYCHAIN_ACCOUNT = "service-account"
+KEYCHAIN_SA = "keychain"  # --sa value that selects the macOS login Keychain
 DEFAULT_USER = os.environ.get("GMAIL_BLOCK_USER", "you@example.com")
 SMTP_CREDS_PATH = Path(
     os.environ.get("GMAIL_SMTP_CREDS", "secrets/gmail-smtp.md")
@@ -336,6 +339,40 @@ def _sign_assertion(creds: dict[str, Any], subject: str, scopes: list[str]) -> s
     return f"{si}.{_b64url(sig)}"
 
 
+def read_keychain_credential() -> dict[str, Any]:
+    """Read the service-account JSON from the macOS login Keychain.
+
+    Always uses Apple's /usr/bin/security so access does not depend on this
+    program's code signature. Output and errors are never echoed.
+    """
+    try:
+        response = subprocess.run(
+            ["/usr/bin/security", "find-generic-password",
+             "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("The macOS Keychain did not respond. Unlock your login keychain and try again.") from None
+    except OSError:
+        raise RuntimeError("The macOS security tool could not start.") from None
+    if response.returncode:
+        raise RuntimeError("No Google key is stored on this Mac. Import it in Settings.")
+    raw = response.stdout.strip()
+    # security prints hex when the stored data is not plain printable text.
+    if raw and not raw.startswith("{") and len(raw) % 2 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", raw):
+        try:
+            raw = bytes.fromhex(raw).decode("utf-8")
+        except ValueError:
+            raise RuntimeError("The stored Google key could not be read.") from None
+    try:
+        credential = json.loads(raw)
+    except ValueError:
+        raise RuntimeError("The stored Google key is not valid service-account JSON.") from None
+    if not isinstance(credential, dict):
+        raise RuntimeError("The stored Google key is not valid service-account JSON.")
+    return credential
+
+
 def get_sa_token(sa_path: Path | str | dict[str, Any], subject: str, *, permanent_delete: bool = False) -> tuple[str, bool]:
     """
     Acquires OAuth access token.
@@ -347,6 +384,8 @@ def get_sa_token(sa_path: Path | str | dict[str, Any], subject: str, *, permanen
     # retain the existing file interface; no key is written by the app wrapper.
     if isinstance(sa_path, dict):
         creds = sa_path
+    elif str(sa_path) == KEYCHAIN_SA:
+        creds = read_keychain_credential()
     else:
         path = Path(sa_path)
         if not path.is_file():
@@ -1221,7 +1260,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sa",
         type=Path,
         default=DEFAULT_SA_PATH,
-        help=f"Path to service account credentials JSON (default: {DEFAULT_SA_PATH})",
+        help=f"Path to service account credentials JSON, or 'keychain' to use the key stored in the macOS login Keychain (default: {DEFAULT_SA_PATH})",
     )
     common_root.add_argument(
         "--user",

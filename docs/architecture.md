@@ -13,7 +13,7 @@ Messages included from Trash/Spam for the deletion preview are excluded from aut
 
 Committed permanent deletion adds full mail scope with no fallback. Every selected ID's From header is checked against the confirmed sender/domain before batchDelete. The engine rereads every selected ID and requires HTTP 404 to verify absence. A failure, mismatched sender, or incomplete verification prevents a success result. The delete command does not rerun blocking, unsubscribe, DNS/RDAP, or IMAP operations and does not pick up newly arrived messages outside the confirmed preview.
 
-There is no publisher-operated server or persistent mailbox database. CLI credentials remain operator-provided files. The packaged app invokes app/engine_launcher.py as a standalone executable, reads the 1Password field into memory, supplies that credential directly to engine authentication, and signs with bundled cryptography. Its nonsecret account configuration and Settings preferences identify the mailbox and vault field. Tokens and results pass through local process memory; stdout/stderr are drained concurrently by the GUI. The separate CLI OpenSSL fallback uses a temporary private-key file. See [PRIVACY.md](../PRIVACY.md) for all external recipients.
+There is no publisher-operated server or persistent mailbox database. CLI credentials remain operator-provided files. The packaged app invokes app/engine_launcher.py as a standalone executable, reads the Keychain item or 1Password field into memory, supplies that credential directly to engine authentication, and signs with bundled cryptography. Its nonsecret account configuration and Settings preferences identify the mailbox and vault field. Tokens and results pass through local process memory; stdout/stderr are drained concurrently by the GUI. The separate CLI OpenSSL fallback uses a temporary private-key file. See [PRIVACY.md](../PRIVACY.md) for all external recipients.
 
 ## Source map
 
@@ -25,7 +25,7 @@ There is no publisher-operated server or persistent mailbox database. CLI creden
 | app/Sources/GmailBlockApp/ContentView.swift | SwiftUI screens |
 | app/Sources/GmailBlockApp/Models.swift | Result decoding |
 | app/Package.swift | Swift build definition |
-| app/engine_launcher.py | In-memory 1Password and packaged engine bridge |
+| app/engine_launcher.py | In-memory Keychain/1Password and packaged engine bridge |
 | app/Sources/GmailBlockApp/AccountConfiguration.swift | Nonsecret account configuration and preferences |
 | scripts/package-app.py | Local app and ZIP builder |
 | scripts/make-icon.swift | AppKit app-icon renderer |

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build a local macOS app without embedding credentials.
 
-Pass --config only for a private personalised build; it contains mailbox and
-1Password field references, never a service-account private key. Requires Swift,
+Pass --config only for a private personalised build; it contains mailbox,
+credential-source and 1Password field references, never a service-account private key. Requires Swift,
 uv, the installed official 1Password CLI, and macOS iconutil/codesign/ditto.
 """
 import argparse
@@ -28,11 +28,16 @@ def main():
     config = {'mailbox': '', 'secretReference': '', 'serviceAccount': ''}
     if args.config:
         supplied = json.loads(args.config.read_text())
-        if (not set(config).issubset(supplied) or set(supplied) - {*config, 'opConfigDirectory'}
+        if (not set(config).issubset(supplied) or set(supplied) - {*config, 'opConfigDirectory', 'credentialSource'}
                 or any(not isinstance(v,str) for v in supplied.values())):
-            parser.error('Configuration requires mailbox, secretReference, serviceAccount; optionally opConfigDirectory. All are strings.')
-        if not supplied['secretReference'].startswith('op://') or 'PRIVATE KEY' in json.dumps(supplied):
-            parser.error('Configuration must contain a 1Password reference, never a private key.')
+            parser.error('Configuration requires mailbox, secretReference, serviceAccount; optionally opConfigDirectory and credentialSource. All are strings.')
+        source = supplied.get('credentialSource', '1password')
+        if source not in ('keychain', '1password'):
+            parser.error('credentialSource must be keychain or 1password.')
+        if 'PRIVATE KEY' in json.dumps(supplied):
+            parser.error('Configuration must never contain a private key.')
+        if source == '1password' and not supplied['secretReference'].startswith('op://'):
+            parser.error('A 1Password configuration needs an op:// secret reference.')
         config = supplied
     op = shutil.which('op')
     if not op:
@@ -66,6 +71,9 @@ def main():
     shutil.copy2(Path(op).resolve(),helpers / 'op')
     # Preserve the official helper's vendor signature for 1Password integration.
     run('codesign','--verify','--strict',helpers / 'op')
+    helper_script = resources / 'block-sender.sh'
+    shutil.copy2(REPO / 'scripts/mail-integration/block-sender.sh', helper_script)
+    helper_script.chmod(0o755)
     (resources / 'AccountConfiguration.json').write_text(json.dumps(config,indent=2)+'\n')
     (contents / 'Info.plist').write_bytes(plistlib.dumps({
         'CFBundleName':'Gmail Nuker','CFBundleDisplayName':'Gmail Nuker',

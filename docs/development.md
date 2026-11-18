@@ -22,7 +22,7 @@ Help and syntax/build checks do not authenticate or touch a mailbox. CLI operati
 
 ## App packaging checks
 
-Run `python3 scripts/package-app.py` for a generic local build, or pass a private nonsecret `--config` for a personal build. Verify `codesign --verify --deep --strict "dist/Gmail Nuker.app"`, launch the app from outside the checkout, and test its input/preview/cancel/confirmed-delete flow with a synthetic helper in a separate test bundle. Never replace the installed production helper with a fixture. Test the packaged 1Password bridge with mocked credentials/providers; a live profile check requires explicit operator authority.
+Run `python3 scripts/package-app.py` for a generic local build, or pass a private nonsecret `--config` for a personal build. Verify `codesign --verify --deep --strict "dist/Gmail Nuker.app"`, launch the app from outside the checkout, and test its input/preview/cancel/confirmed-delete flow with a synthetic helper in a separate test bundle. Never replace the installed production helper with a fixture. Test the packaged Keychain and 1Password bridges with mocked credentials/providers; a live profile check requires explicit operator authority.
 
 Inspect the app and archive for private keys, cached tokens, credential files, and unintended mailbox metadata. A personal account configuration can contain a mailbox and vault-item reference, which should not enter a public build. Licences and pinned runtime versions are bundled in Resources/Licenses. Signing is ad hoc for local use, not Developer ID notarisation.
 

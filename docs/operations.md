@@ -36,6 +36,6 @@ Use Gmail's interface to move recoverable messages out of Trash and apply the de
 
 ## Credential rotation and uninstall
 
-Revoke exposed service-account keys and app passwords through Google. Review or remove domain-wide delegation if access is no longer needed. Update local configuration to a replacement key only after authorising it appropriately. Removing the source folder leaves remote Gmail filters intact and does not revoke credentials. Remove filters and revoke access separately.
+Revoke exposed service-account keys and app passwords through Google. Review or remove domain-wide delegation if access is no longer needed. Update local configuration to a replacement key only after authorising it appropriately: in the app, import the new JSON in Settings (it replaces the Keychain item) or choose **Remove from this Mac** to delete the stored key; for 1Password, update the referenced field; for the CLI, replace the file or re-import for `--sa keychain`. Uninstalling the app does not delete a Keychain item, so remove it in Settings first (or with `security delete-generic-password -s uk.magrathean.gmail-nuker -a service-account`). Removing the source folder leaves remote Gmail filters intact and does not revoke credentials. Remove filters and revoke access separately.
 
 Do not publish real metadata when asking for help. Follow [SUPPORT.md](../SUPPORT.md) or the private security route.

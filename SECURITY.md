@@ -12,6 +12,8 @@ Include the commit, platform, command or affected component, expected and actual
 
 ## Security-sensitive boundaries
 
+The app can keep the Google key in your macOS login keychain (default) or fetch it from 1Password. A Keychain key is readable without a prompt by any process running as your user through `/usr/bin/security` while the login keychain is unlocked; 1Password requires approval each time. Choose 1Password if that difference matters.
+
 Report realistic credential disclosure, unsafe handling of sender-controlled unsubscribe URLs, shell or argument injection, mailbox changes beyond documented target/commit controls, unexpected sending, and compromised distribution or dependencies.
 
 Mail headers, domains, MX records, and RDAP responses are untrusted inputs. The service-account key and delegation grants may allow access beyond the mailbox used in a command. Keep keys outside Git and restrict their local permissions. .gitignore reduces accidental inclusion; it does not protect already tracked files or act as a secret scanner.

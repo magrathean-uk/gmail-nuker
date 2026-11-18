@@ -1,7 +1,7 @@
-"""Private-process bridge between the native app, 1Password and the mail engine.
+"""Private-process bridge between the native app, the credential store and the mail engine.
 
-Built as a standalone executable. The service-account JSON stays in memory.
-Raw 1Password output is not forwarded to the GUI.
+Built as a standalone executable. The service-account JSON (macOS Keychain or 1Password) stays in memory.
+Raw credential-tool output is not forwarded to the GUI.
 """
 import json
 import os
@@ -17,6 +17,29 @@ class SetupError(RuntimeError):
     pass
 
 
+def validate_credential(source, expected_email, failure='The stored Google key is not the expected service-account JSON.'):
+    """Parse and check a service-account JSON string (or dict); never echo its content."""
+    try:
+        credential = json.loads(source) if isinstance(source, (str, bytes)) else source
+        if (credential.get('type') != 'service_account'
+                or not credential.get('private_key')
+                or not credential.get('client_email')
+                or (expected_email and credential['client_email'] != expected_email)):
+            raise ValueError()
+    except (ValueError, AttributeError, TypeError):
+        raise SetupError(failure) from None
+    return credential
+
+
+def read_keychain(expected_email):
+    try:
+        credential = gmail_engine.read_keychain_credential()
+    except RuntimeError as error:
+        raise SetupError(str(error)) from None
+    return validate_credential(credential, expected_email,
+                               'The Google key stored on this Mac is not the expected service-account JSON. Import it again in Settings.')
+
+
 def read_credential(reference, expected_email, op_path):
     if not reference.startswith('op://') or len(reference.split('/')) not in (5, 6):
         raise SetupError('Enter a valid 1Password secret reference in Settings.')
@@ -29,16 +52,8 @@ def read_credential(reference, expected_email, op_path):
         raise SetupError('The 1Password helper could not start. Reinstall the app.') from None
     if response.returncode:
         raise SetupError('Unlock 1Password and approve access. Enable “Integrate with 1Password CLI” in 1Password Settings → Developer.')
-    try:
-        credential = json.loads(response.stdout)
-        if (credential.get('type') != 'service_account'
-                or not credential.get('private_key')
-                or not credential.get('client_email')
-                or (expected_email and credential['client_email'] != expected_email)):
-            raise ValueError()
-    except (ValueError, AttributeError, TypeError):
-        raise SetupError('The selected 1Password field is not the expected Google service-account JSON.') from None
-    return credential
+    return validate_credential(response.stdout, expected_email,
+                               'The selected 1Password field is not the expected Google service-account JSON.')
 
 
 def execute(arguments, credential, mailbox):
@@ -71,7 +86,10 @@ def main():
         raise SetupError('Enter your Workspace email address in Settings.')
     op_path = Path(sys.executable).resolve().parents[2] / 'Helpers' / 'op'
     os.environ['SSL_CERT_FILE'] = certifi.where()
-    credential = read_credential(reference, expected_email, op_path)
+    if os.environ.get('GMAIL_NUKER_CREDENTIAL_SOURCE', '').strip() == 'keychain':
+        credential = read_keychain(expected_email)
+    else:
+        credential = read_credential(reference, expected_email, op_path)
     try:
         return execute(sys.argv[1:], credential, mailbox)
     finally:
