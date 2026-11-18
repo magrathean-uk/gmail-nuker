@@ -21,10 +21,36 @@ enum KeychainStore {
         }
     }
 
+    private static func loginKeychain() -> SecKeychain? {
+        guard let path = loginKeychainPath() else { return nil }
+        var keychain: SecKeychain?
+        return SecKeychainOpen(path, &keychain) == errSecSuccess ? keychain : nil
+    }
+
+    /// Identifies the item, restricted to the login keychain so another keychain cannot answer.
     private static var query: [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service,
-         kSecAttrAccount as String: account]
+        var result: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                     kSecAttrService as String: service,
+                                     kSecAttrAccount as String: account]
+        if let login = loginKeychain() { result[kSecMatchSearchList as String] = [login] }
+        return result
+    }
+
+    /// Path of the login keychain for `security`, or nil to use its default search list.
+    private static func loginKeychainPath() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: securityTool)
+        process.arguments = ["login-keychain"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        let path = text.trimmingCharacters(in: CharacterSet(charactersIn: "\"").union(.whitespacesAndNewlines))
+        return path.hasPrefix("/") ? path : nil
     }
 
     /// Metadata only (no secret data requested), so this never prompts.
@@ -57,7 +83,12 @@ enum KeychainStore {
         guard let compact = try? JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes]) else {
             throw StoreError.invalidKey("That is not a Google service-account JSON key.")
         }
-        remove()
+        if lookup() != nil {
+            // Rotate in place so a failure cannot lose the working key; the access list is kept.
+            let changes: [String: Any] = [kSecValueData as String: compact, kSecAttrComment as String: email]
+            guard SecItemUpdate(query as CFDictionary, changes as CFDictionary) == errSecSuccess else { throw StoreError.keychain }
+            return email
+        }
         var access: SecAccess?
         var selfApp: SecTrustedApplication?
         var tool: SecTrustedApplication?
@@ -65,8 +96,10 @@ enum KeychainStore {
               SecTrustedApplicationCreateFromPath(securityTool, &tool) == errSecSuccess,
               let selfApp, let tool,
               SecAccessCreate(label as CFString, [selfApp, tool] as CFArray, &access) == errSecSuccess,
-              let access else { throw StoreError.keychain }
+              let access, let login = loginKeychain() else { throw StoreError.keychain }
         var attributes = query
+        attributes.removeValue(forKey: kSecMatchSearchList as String)
+        attributes[kSecUseKeychain as String] = login
         attributes[kSecAttrLabel as String] = label
         attributes[kSecAttrComment as String] = email
         attributes[kSecAttrAccess as String] = access
@@ -75,14 +108,16 @@ enum KeychainStore {
         return email
     }
 
-    /// Deletes through Apple's tool so the item is removed even if another build created it.
-    static func remove() {
+    /// Deletes through Apple's tool from the login keychain. A missing item (exit 44) counts as success.
+    @discardableResult
+    static func remove() -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: securityTool)
-        process.arguments = ["delete-generic-password", "-s", service, "-a", account]
+        process.arguments = ["delete-generic-password", "-s", service, "-a", account] + (loginKeychainPath().map { [$0] } ?? [])
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        try? process.run()
+        guard (try? process.run()) != nil else { return false }
         process.waitUntilExit()
+        return process.terminationStatus == 0 || process.terminationStatus == 44
     }
 }

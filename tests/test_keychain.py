@@ -27,28 +27,45 @@ def completed(code, out='', err=''):
     return subprocess.CompletedProcess([], code, out, err)
 
 
+LOGIN = '/fixture/Library/Keychains/login.keychain-db'
+
+
+def fake_security(secret=COMPACT + '\n', code=0, login_ok=True):
+    def run(command, **kwargs):
+        if command[1] == 'login-keychain':
+            return completed(0 if login_ok else 1, '    "%s"\n' % LOGIN if login_ok else '')
+        return completed(code, secret, secret)
+    return run
+
+
 class ReaderChecks(unittest.TestCase):
-    def test_uses_apple_security_tool_with_argument_list(self):
-        with patch.object(engine.subprocess, 'run', return_value=completed(0, COMPACT + '\n')) as run:
+    def test_uses_apple_security_tool_with_login_keychain_argument_list(self):
+        with patch.object(engine.subprocess, 'run', side_effect=fake_security()) as run:
             self.assertEqual(engine.read_keychain_credential(), CREDENTIAL)
-        self.assertEqual(run.call_args.args[0], ['/usr/bin/security', 'find-generic-password', '-s',
-                                                 'uk.magrathean.gmail-nuker', '-a', 'service-account', '-w'])
-        self.assertTrue(run.call_args.kwargs['capture_output'])
-        self.assertIn('timeout', run.call_args.kwargs)
-        self.assertNotIn('shell', run.call_args.kwargs)
+        read = run.call_args_list[-1]
+        self.assertEqual(read.args[0], ['/usr/bin/security', 'find-generic-password', '-s',
+                                        'uk.magrathean.gmail-nuker', '-a', 'service-account', '-w', LOGIN])
+        self.assertTrue(read.kwargs['capture_output'])
+        self.assertIn('timeout', read.kwargs)
+        self.assertNotIn('shell', read.kwargs)
+
+    def test_falls_back_to_no_keychain_argument(self):
+        with patch.object(engine.subprocess, 'run', side_effect=fake_security(login_ok=False)) as run:
+            engine.read_keychain_credential()
+        self.assertEqual(run.call_args_list[-1].args[0][-1], '-w')
 
     def test_hex_output_is_decoded(self):
-        with patch.object(engine.subprocess, 'run', return_value=completed(0, COMPACT.encode().hex() + '\n')):
+        with patch.object(engine.subprocess, 'run', side_effect=fake_security(COMPACT.encode().hex() + '\n')):
             self.assertEqual(engine.read_keychain_credential(), CREDENTIAL)
 
     def test_failure_hides_tool_output(self):
-        with patch.object(engine.subprocess, 'run', return_value=completed(44, 'SYNTHETIC SECRET', 'SYNTHETIC SECRET')):
+        with patch.object(engine.subprocess, 'run', side_effect=fake_security('SYNTHETIC SECRET', 44)):
             with self.assertRaises(RuntimeError) as error:
                 engine.read_keychain_credential()
         self.assertNotIn('SYNTHETIC SECRET', str(error.exception))
 
     def test_invalid_json_hides_content(self):
-        with patch.object(engine.subprocess, 'run', return_value=completed(0, 'SYNTHETIC SECRET')):
+        with patch.object(engine.subprocess, 'run', side_effect=fake_security('SYNTHETIC SECRET')):
             with self.assertRaises(RuntimeError) as error:
                 engine.read_keychain_credential()
         self.assertNotIn('SYNTHETIC SECRET', str(error.exception))
@@ -110,6 +127,20 @@ class CliChecks(unittest.TestCase):
         reader.assert_called_once()
         self.assertEqual(token, 't')
         self.assertEqual(sign.call_args.args[0], CREDENTIAL)
+
+    def test_relative_keychain_path_is_a_file_not_the_keychain(self):
+        args = engine.build_parser().parse_args(['--sa', './keychain', 'list'])
+        self.assertEqual(args.sa, './keychain')
+        with patch.object(engine, 'read_keychain_credential') as reader:
+            with self.assertRaises(FileNotFoundError):
+                engine.get_sa_token(args.sa, 'fixture@example.test')
+        reader.assert_not_called()
+
+    def test_environment_default_keychain_is_recognised(self):
+        with patch.object(engine, 'read_keychain_credential', side_effect=RuntimeError('x')) as reader:
+            with self.assertRaises(RuntimeError):
+                engine.get_sa_token('keychain', 'fixture@example.test')
+        reader.assert_called_once()
 
     def test_help_mentions_keychain(self):
         self.assertIn('keychain', engine.build_parser().format_help())

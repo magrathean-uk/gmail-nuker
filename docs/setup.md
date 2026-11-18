@@ -63,7 +63,7 @@ python3 scripts/package-app.py
 open "dist/Gmail Nuker.app"
 ```
 
-Open Account Settings and enter the delegated Workspace address. Under **Google key** choose where the service-account JSON lives.
+Open Account Settings and enter the delegated Workspace address. Under **Google key** choose where the service-account JSON lives. Until you choose, an existing `op://` reference keeps 1Password in use; otherwise the Keychain is used.
 
 - **This Mac (Keychain)**, the default: click **Import JSON File…** and pick the downloaded key (or **Copy from 1Password** if a 1Password reference is saved). The app validates it and stores it as a generic password in your login keychain (service `uk.magrathean.gmail-nuker`, account `service-account`); you can then delete the downloaded file. **Remove from this Mac** deletes it. Reads go through Apple's `/usr/bin/security`, so rebuilding the app does not trigger prompts. Trade-off: while your login keychain is unlocked, any program running as you can read the key through that tool without a prompt.
 - **1Password**: enter an `op://Vault/Item/credential` secret reference for a field containing the complete service-account JSON. Enable **1Password Settings → Developer → Integrate with 1Password CLI**, keep 1Password installed, and approve its access request each time.

@@ -54,12 +54,7 @@ except ImportError:
 
 # ── Paths and Defaults ────────────────────────────────────────────────────────
 
-DEFAULT_SA_PATH = Path(
-    os.environ.get(
-        "GMAIL_BLOCK_SA",
-        "secrets/service-account.json",
-    )
-)
+DEFAULT_SA_PATH = os.environ.get("GMAIL_BLOCK_SA", "secrets/service-account.json")
 KEYCHAIN_SERVICE = "uk.magrathean.gmail-nuker"
 KEYCHAIN_ACCOUNT = "service-account"
 KEYCHAIN_SA = "keychain"  # --sa value that selects the macOS login Keychain
@@ -339,6 +334,20 @@ def _sign_assertion(creds: dict[str, Any], subject: str, scopes: list[str]) -> s
     return f"{si}.{_b64url(sig)}"
 
 
+def _login_keychain_args() -> list[str]:
+    """Trailing keychain argument for `security` so only the login keychain is used.
+
+    Falls back to no argument (default search list) if the path cannot be determined.
+    """
+    try:
+        response = subprocess.run(["/usr/bin/security", "login-keychain"],
+                                  capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        return []
+    path = response.stdout.strip().strip('"').strip() if not response.returncode else ""
+    return [path] if path.startswith("/") and "\n" not in path else []
+
+
 def read_keychain_credential() -> dict[str, Any]:
     """Read the service-account JSON from the macOS login Keychain.
 
@@ -348,7 +357,7 @@ def read_keychain_credential() -> dict[str, Any]:
     try:
         response = subprocess.run(
             ["/usr/bin/security", "find-generic-password",
-             "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
+             "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w", *_login_keychain_args()],
             capture_output=True, text=True, timeout=30,
         )
     except subprocess.TimeoutExpired:
@@ -384,7 +393,7 @@ def get_sa_token(sa_path: Path | str | dict[str, Any], subject: str, *, permanen
     # retain the existing file interface; no key is written by the app wrapper.
     if isinstance(sa_path, dict):
         creds = sa_path
-    elif str(sa_path) == KEYCHAIN_SA:
+    elif isinstance(sa_path, str) and sa_path == KEYCHAIN_SA:
         creds = read_keychain_credential()
     else:
         path = Path(sa_path)
@@ -1258,7 +1267,7 @@ def build_parser() -> argparse.ArgumentParser:
     common_root = argparse.ArgumentParser(add_help=False)
     common_root.add_argument(
         "--sa",
-        type=Path,
+        type=str,
         default=DEFAULT_SA_PATH,
         help=f"Path to service account credentials JSON, or 'keychain' to use the key stored in the macOS login Keychain (default: {DEFAULT_SA_PATH})",
     )
@@ -1269,7 +1278,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     common_sub = argparse.ArgumentParser(add_help=False)
-    common_sub.add_argument("--sa", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common_sub.add_argument("--sa", type=str, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common_sub.add_argument("--user", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common_sub.add_argument("--json", action="store_true", default=False, help="Output machine-readable JSON")
 

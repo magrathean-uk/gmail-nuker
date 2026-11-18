@@ -25,10 +25,9 @@ struct AccountConfiguration: Codable, Sendable {
         return result
     }
 
-    /// Saved choice if any; otherwise Keychain when a key is stored, then 1Password when a reference is set.
+    /// Saved choice if any; otherwise 1Password when an op:// reference is configured (legacy setups), else Keychain.
     var effectiveSource: String {
         if let credentialSource, ["keychain", "1password"].contains(credentialSource) { return credentialSource }
-        if KeychainStore.exists { return "keychain" }
         return secretReference.hasPrefix("op://") ? "1password" : "keychain"
     }
     var usesKeychain: Bool { effectiveSource == "keychain" }

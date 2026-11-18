@@ -192,6 +192,10 @@ public struct ContentView: View {
     }
 }
 
+private enum CopyOutcome: Sendable {
+    case key(Data), timedOut, failed
+}
+
 struct AccountSettingsView: View {
     @Bindable var viewModel: BlockViewModel
     @State private var mailbox = AccountConfiguration.load().mailbox
@@ -236,12 +240,7 @@ struct AccountSettingsView: View {
         .formStyle(.grouped).padding(12).frame(width: 520, height: 520)
         .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in importKey(result) }
         .confirmationDialog("Remove the Google key from this Mac?", isPresented: $confirmRemoval) {
-            Button("Remove Key", role: .destructive) {
-                KeychainStore.remove()
-                storedKey = KeychainStore.lookup()
-                keyMessage = "The key was removed from this Mac."
-                viewModel.refreshAccount()
-            }
+            Button("Remove Key", role: .destructive) { removeKey() }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Gmail Nuker will stop working until you import a key again. The key in Google Cloud is not affected.")
@@ -289,16 +288,35 @@ struct AccountSettingsView: View {
         store(data, success: "Key stored on this Mac. You can now delete the downloaded JSON file.")
     }
 
+    /// Keychain work can wait on an unlock prompt, so it runs off the main actor.
     private func store(_ data: Data, success: String) {
-        do {
-            try KeychainStore.store(json: data, expectedEmail: AccountConfiguration.load().serviceAccount)
-            storedKey = KeychainStore.lookup()
+        let expected = AccountConfiguration.load().serviceAccount
+        copying = true
+        Task {
+            let outcome = await Task.detached { () -> String? in
+                do { try KeychainStore.store(json: data, expectedEmail: expected); return nil }
+                catch { return error.localizedDescription }
+            }.value
+            let stored = await Task.detached { KeychainStore.lookup() }.value
+            copying = false
+            storedKey = stored
+            if let outcome { keyMessage = outcome; return }
             source = "keychain"
             UserDefaults.standard.set("keychain", forKey: "credentialSource")
             keyMessage = success
             viewModel.refreshAccount()
-        } catch {
-            keyMessage = error.localizedDescription
+        }
+    }
+
+    private func removeKey() {
+        copying = true
+        Task {
+            let removed = await Task.detached { KeychainStore.remove() }.value
+            let stored = await Task.detached { KeychainStore.lookup() }.value
+            copying = false
+            storedKey = stored
+            keyMessage = removed ? "The key was removed from this Mac." : "The key could not be removed. Unlock your login keychain and try again."
+            viewModel.refreshAccount()
         }
     }
 
@@ -309,7 +327,7 @@ struct AccountSettingsView: View {
         copying = true
         keyMessage = "Approve 1Password if prompted…"
         Task {
-            let data = await Task.detached { () -> Data? in
+            let outcome = await Task.detached { () -> CopyOutcome in
                 let process = Process()
                 process.executableURL = helper
                 process.arguments = ["read", reference]
@@ -321,13 +339,24 @@ struct AccountSettingsView: View {
                 let output = Pipe()
                 process.standardOutput = output
                 process.standardError = FileHandle.nullDevice
-                guard (try? process.run()) != nil else { return nil }
+                guard (try? process.run()) != nil else { return .failed }
+                // Bound the wait: terminate the helper if 1Password never answers.
+                let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 120, execute: timeout)
                 let data = output.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-                return process.terminationStatus == 0 ? data : nil
+                timeout.cancel()
+                if process.terminationReason == .uncaughtSignal { return .timedOut }
+                return process.terminationStatus == 0 ? .key(data) : .failed
             }.value
             copying = false
-            guard let data else {
+            let data: Data
+            switch outcome {
+            case .key(let value): data = value
+            case .timedOut:
+                keyMessage = "1Password approval timed out. Unlock 1Password and try again."
+                return
+            case .failed:
                 keyMessage = "Could not read the key from 1Password. Unlock it and try again."
                 return
             }
