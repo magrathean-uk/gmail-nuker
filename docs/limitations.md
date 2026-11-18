@@ -4,7 +4,8 @@ These limitations describe the source at the initial public release and document
 
 - Consumer Gmail OAuth login is not implemented. Service-account delegation requires an authorised Workspace environment; optional IMAP fallback only applies after service-account authentication.
 - Domain expansion uses embedded provider/suffix lists and heuristics, not a complete live Public Suffix List. Gmail from matching is provider-defined and is not proof of domain ownership or sender authentication.
-- Mail inventory reads a single Gmail search page, default 50 and at most 500 IDs. It does not follow pagination. Failed metadata reads can produce blank header entries.
+- Mail inventory follows Gmail pagination up to 5000 message IDs per block (history_truncated is set when more exist; run the block again to continue). Detailed previews cover only the first 50. scan stays at 50 by default. Failed metadata reads can produce blank header entries.
+- The offender list samples at most 500 recent inbox messages by default, so counts are a sample, not a full mailbox total.
 - API purge operates on fetched IDs. IMAP fallback performs its own FROM search of All Mail, can affect more mail than the preview, and may broaden a shared-platform target to the root domain. It assumes English Gmail folder naming and uses Deleted/expunge.
 - Future incoming mail and CLI block --purge use Trash. The GUI wipe and CLI delete --commit permanently delete only selected preview IDs and verify absence; they do not claim all historical messages or provider-retained copies were erased. Some older engine wording overstates Trash behavior. Matching and provider retention remain subject to Gmail behavior.
 - --commit can automatically contact sender-controlled unsubscribe URLs or send an unsubscribe email. There is no independent opt-out flag, and redirects may be followed.

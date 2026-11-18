@@ -2,7 +2,7 @@
 
 A Gmail sender and domain blocker with a Python CLI and a native macOS SwiftUI app.
 
-Creates Gmail filters that send matching messages to Trash and remove Inbox, unread, and important labels. It can also trash existing mail or permanently delete explicitly selected preview messages. The macOS wipe action asks for confirmation, permanently deletes only the listed messages, and verifies removal. Public webmail providers and shared hosting domains receive narrower matching to reduce accidental blocking.
+Creates Gmail filters that send matching messages to Trash and remove Inbox, unread, and important labels. It can also trash existing mail or permanently delete explicitly selected preview messages. The macOS wipe action asks for confirmation, states the real number of matching messages across the whole mailbox history (up to a 5,000-message cap), permanently deletes exactly those messages, and verifies removal. Public webmail providers and shared hosting domains receive narrower matching to reduce accidental blocking.
 
 ## Configuration
 
@@ -48,11 +48,11 @@ open "dist/Gmail Nuker.app"
 
 The app bundles its Python engine/runtime, cryptography, certificate trust store and 1Password helper. It launches from Finder without a checkout or Terminal environment. In Account Settings, enter your Workspace mailbox and choose where the Google key lives: **This Mac (Keychain)**, the default, or **1Password**. For the Keychain, import the service-account JSON file once (then delete the downloaded file) or copy it from 1Password. For 1Password, enter the secret reference for the field containing the JSON. Either way the key is read into process memory per operation and is never embedded in the app or archive. A Keychain key is readable without a prompt by any program running as you through `/usr/bin/security` while your login keychain is unlocked; 1Password asks for approval each time.
 
-The UI uses standard macOS controls, a resizable window, keyboard shortcuts, a bounded message preview, and a separate permanent-delete confirmation. Settings includes a read-only connection check. Local bundles use ad-hoc signing; this is not a notarised public release. See [setup](docs/setup.md) for personal configuration and packaging details. Compiled apps and archives remain excluded from source control.
+The window has three sections: **Block** (one sender or domain), **Offender list** (scan the last 30 days of inbox, tick several senders and block them together with one combined delete confirmation) and **Blocked** (searchable list of the filters this tool made, with Unblock; unblocking never restores mail). The app also lives in the menu bar, can open at login (Settings), and has a built-in Mail command: select a message in Mail and press Control-Option-Command-B (or use the menu bar item) to block its sender and move their existing mail to Trash. macOS asks once to let the app control Mail. The UI uses standard macOS controls, a resizable window, keyboard shortcuts, a 50-message preview, and a separate permanent-delete confirmation. Settings includes a read-only connection check. Local bundles use ad-hoc signing; this is not a notarised public release. See [setup](docs/setup.md) for personal configuration and packaging details. Compiled apps and archives remain excluded from source control.
 
 ## Behavior to review
 
-Committed blocks may automatically contact unsubscribe endpoints or send unsubscribe email. CLI `block --purge` moves messages to Trash; IMAP fallback issues Deleted/expunge operations. The GUI previews Spam and Trash too and confirms permanent deletion of the listed IDs. Permanent deletion has no IMAP or Trash fallback. Scans fetch one page, default 50 and at most 500 IDs, rather than every historical message. Review [limitations](docs/limitations.md) before changing a mailbox.
+Committed blocks may automatically contact unsubscribe endpoints or send unsubscribe email. CLI `block --purge` moves messages to Trash; IMAP fallback issues Deleted/expunge operations. The GUI previews Spam and Trash too and confirms permanent deletion of the listed IDs. Permanent deletion has no IMAP or Trash fallback. The app scans the whole matching history, up to 5,000 IDs, and previews the first 50; `--limit` caps CLI scans. Review [limitations](docs/limitations.md) before changing a mailbox.
 
 ## Documentation
 

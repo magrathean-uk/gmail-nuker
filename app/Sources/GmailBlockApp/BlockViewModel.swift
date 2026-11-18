@@ -11,6 +11,36 @@ public enum AppPhase: Sendable, Equatable {
     case error(String)
 }
 
+public enum AppSection: String, Sendable, CaseIterable, Identifiable {
+    case block = "Block", offenders = "Offender list", blocked = "Blocked"
+    public var id: String { rawValue }
+}
+
+/// One sender's result after blocking it: the preview to confirm, or why it failed.
+struct SenderPreview: Identifiable, Equatable {
+    let sender: String
+    let result: BlockResult?
+    let error: String?
+    var id: String { sender }
+    var count: Int { result?.total ?? 0 }
+}
+
+struct SenderOutcome: Identifiable, Equatable {
+    let sender: String
+    let message: String
+    let failed: Bool
+    var id: String { sender }
+}
+
+enum OffenderPhase: Equatable {
+    case idle, scanning
+    case blocking(String)
+    case confirm([SenderPreview])
+    case deleting(String)
+    case done([SenderOutcome])
+    case error(String)
+}
+
 @Observable
 @MainActor
 public final class BlockViewModel {
@@ -21,7 +51,22 @@ public final class BlockViewModel {
     public var connectionChecked = false
     public var operationError: String?
 
-    private let service: BlockService
+    public var section: AppSection = .block
+
+    // Offender list
+    var offenderPhase: OffenderPhase = .idle
+    var offenderList: [Offender] = []
+    var selectedOffenders: Set<String> = []
+    var hasScanned = false
+
+    // Blocked list
+    var blockedList: [BlockedFilter] = []
+    var blockedSearch = ""
+    var blockedLoading = false
+    var blockedMessage: String?
+    var blockedError: String?
+
+    let service: BlockService
 
     public init(service: BlockService = BlockService()) {
         self.service = service
@@ -37,7 +82,7 @@ public final class BlockViewModel {
         currentPhase = .blocking
 
         do {
-            let result = try await service.executeBlock(target: trimmed, commit: true, purge: false, includeSpamTrash: true)
+            let result = try await service.executeBlock(target: trimmed, exact: false, commit: true, purge: false, includeSpamTrash: true)
             isBusy = false
             currentPhase = .blockedPromptWipe(result)
         } catch {

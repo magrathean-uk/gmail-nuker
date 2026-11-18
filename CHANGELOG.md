@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- App: three sections (Block, Offender list, Blocked). Blocking now covers the whole matching history (up to 5,000 messages) and the confirmation states the real total. The Offender list scans the last 30 days of inbox, blocks several selected senders exactly and deletes after one combined confirmation. The Blocked list searches the tool's filters and unblocks one (mail is never restored).
+- App: menu bar icon, open at login (first launch enables it; Settings toggles it), the Dock icon only while a window is open, and a built-in Mail command (Control-Option-Command-B or menu item) that blocks the selected sender and trashes their existing mail via the bundled script. Adds `NSAppleEventsUsageDescription`.
+
 - Add a choice of where the Google key lives: the macOS login Keychain (new default, no prompts) or 1Password. Settings can import a JSON file, copy from 1Password or remove the key; the CLI accepts `--sa keychain`. The Keychain item is readable by processes running as the user while the keychain is unlocked; 1Password still asks each time.
 - Add a Mail.app integration (`scripts/mail-integration/`) that blocks the selected sender via the installed app, now bundled in the app and Keychain-aware.
 

@@ -5,6 +5,7 @@ Raw credential-tool output is not forwarded to the GUI.
 """
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -56,6 +57,38 @@ def read_credential(reference, expected_email, op_path):
                                'The selected 1Password field is not the expected Google service-account JSON.')
 
 
+def validate_arguments(arguments):
+    """Allow exactly the app's commands; return the argument list to parse (unblock gains --id-only)."""
+    unsupported = SetupError('The app requested an unsupported mail operation.')
+    if not arguments or '--json' not in arguments:
+        raise unsupported
+    command = arguments[0]
+    if command in ('block', 'delete'):
+        return list(arguments)
+    if command == 'list':
+        if arguments != ['list', '--json']:
+            raise unsupported
+        return list(arguments)
+    if command == 'unblock':
+        if len(arguments) < 3 or not re.fullmatch(r'[A-Za-z0-9_-]+', arguments[1]):
+            raise unsupported
+        if any(a not in ('--json', '--commit') for a in arguments[2:]):
+            raise unsupported
+        return list(arguments) + ['--id-only']
+    if command == 'offenders':
+        rest = arguments[1:]
+        index = 0
+        while index < len(rest):
+            if rest[index] == '--json':
+                index += 1
+            elif rest[index] in ('--days', '--sample') and index + 1 < len(rest) and re.fullmatch(r'[0-9]{1,5}', rest[index + 1]):
+                index += 2
+            else:
+                raise unsupported
+        return list(arguments)
+    raise unsupported
+
+
 def execute(arguments, credential, mailbox):
     if arguments == ['check']:
         token, _ = gmail_engine.get_sa_token(credential, mailbox)
@@ -64,8 +97,7 @@ def execute(arguments, credential, mailbox):
             raise SetupError('Google returned a different mailbox. Check the account in Settings.')
         print(json.dumps({'success': True, 'committed': False}))
         return 0
-    if not arguments or arguments[0] not in ('block', 'delete') or '--json' not in arguments:
-        raise SetupError('The app requested an unsupported mail operation.')
+    arguments = validate_arguments(arguments)
     args = gmail_engine.build_parser().parse_args(arguments)
     args.sa = credential
     args.user = mailbox
@@ -73,7 +105,9 @@ def execute(arguments, credential, mailbox):
     gmail_engine.SMTP_CREDS_PATH = Path('/dev/null')
     if args.command == 'block':
         return gmail_engine.cmd_block(args)
-    return gmail_engine.cmd_delete(args)
+    handlers = {'delete': gmail_engine.cmd_delete, 'list': gmail_engine.cmd_list,
+                'unblock': gmail_engine.cmd_unblock, 'offenders': gmail_engine.cmd_offenders}
+    return handlers[args.command](args)
 
 
 def main():

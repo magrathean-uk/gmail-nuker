@@ -19,8 +19,9 @@ public struct BlockService: Sendable {
         self.scriptPath = scriptPath
     }
 
-    public func executeBlock(target: String, commit: Bool = true, purge: Bool = false, includeSpamTrash: Bool = false) async throws -> BlockResult {
+    public func executeBlock(target: String, exact: Bool = false, commit: Bool = true, purge: Bool = false, includeSpamTrash: Bool = false) async throws -> BlockResult {
         var args = ["block", target, "--json"]
+        if exact { args.append("--exact") }
         if commit {
             args.append("--commit")
         }
@@ -35,24 +36,42 @@ public struct BlockService: Sendable {
     }
 
     public func checkConnection() async throws {
-        _ = try await runScript(args: ["check"])
+        let _: BlockResult = try await runScript(args: ["check"])
+    }
+
+    public func listBlocked() async throws -> [BlockedFilter] {
+        let result: BlockedListResult = try await runScript(args: ["list", "--json"])
+        return result.blocked ?? []
+    }
+
+    /// Removes one filter (never touches mail) and requires the engine to confirm it is gone.
+    public func unblock(filterId: String) async throws {
+        let result: UnblockResult = try await runScript(args: ["unblock", filterId, "--json", "--commit"])
+        guard result.committed == true, result.unblock_verified == true else {
+            throw NSError(domain: "BlockService", code: 1, userInfo: [NSLocalizedDescriptionKey: "The engine did not confirm the filter was removed."])
+        }
+    }
+
+    public func offenders(days: Int = 30) async throws -> [Offender] {
+        let result: OffenderResult = try await runScript(args: ["offenders", "--json", "--days", String(days)])
+        return result.offenders ?? []
     }
 
     public func deletePrevious(result: BlockResult) async throws -> BlockResult {
-        guard let target = result.target, let messages = result.found_messages, !messages.isEmpty else {
-            throw NSError(domain: "BlockService", code: 1, userInfo: [NSLocalizedDescriptionKey: "No preview messages were selected for deletion."])
+        guard let target = result.target, !result.allIDs.isEmpty else {
+            throw NSError(domain: "BlockService", code: 1, userInfo: [NSLocalizedDescriptionKey: "No messages were selected for deletion."])
         }
         var args = ["delete", target.raw, "--json", "--commit"]
         if target.block_mode == "exact" { args.append("--exact") }
-        for message in messages { args += ["--message-id", message.id] }
-        let deletion = try await runScript(args: args)
+        for id in result.allIDs { args += ["--message-id", id] }
+        let deletion: BlockResult = try await runScript(args: args)
         guard deletion.delete_verified == true, deletion.remaining == 0 else {
             throw NSError(domain: "BlockService", code: 1, userInfo: [NSLocalizedDescriptionKey: "The engine did not verify permanent deletion. The incoming block remains active."])
         }
         return deletion
     }
 
-    private func runScript(args: [String]) async throws -> BlockResult {
+    private func runScript<T: Decodable & Sendable>(args: [String]) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
@@ -99,12 +118,12 @@ public struct BlockService: Sendable {
 
                     if !stdoutData.isEmpty {
                         let decoder = JSONDecoder()
-                        let result = try decoder.decode(BlockResult.self, from: stdoutData)
-                        guard result.success else {
+                        let envelope = try decoder.decode(Envelope.self, from: stdoutData)
+                        guard envelope.success else {
                             throw NSError(
                                 domain: "BlockService",
                                 code: Int(process.terminationStatus == 0 ? 1 : process.terminationStatus),
-                                userInfo: [NSLocalizedDescriptionKey: result.error ?? "The mail operation failed."]
+                                userInfo: [NSLocalizedDescriptionKey: envelope.error ?? "The mail operation failed."]
                             )
                         }
                         guard process.terminationStatus == 0 else {
@@ -118,7 +137,7 @@ public struct BlockService: Sendable {
                                 userInfo: [NSLocalizedDescriptionKey: message]
                             )
                         }
-                        continuation.resume(returning: result)
+                        continuation.resume(returning: try decoder.decode(T.self, from: stdoutData))
                     } else {
                         let errString = String(data: stderrData, encoding: .utf8) ?? "Process exited with code \(process.terminationStatus)"
                         continuation.resume(throwing: NSError(domain: "BlockService", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errString]))
@@ -129,6 +148,11 @@ public struct BlockService: Sendable {
             }
         }
     }
+}
+
+private struct Envelope: Decodable {
+    let success: Bool
+    let error: String?
 }
 
 /// A single writer and reader transfer process output across GCD queues.

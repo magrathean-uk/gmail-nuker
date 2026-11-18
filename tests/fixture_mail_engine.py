@@ -10,8 +10,15 @@ if target=='nonzero-success.test':
  print(json.dumps({'success':True,'committed':False}));sys.exit(2)
 if target=='stderr-failure.test':
  print('Synthetic engine failure',file=sys.stderr);sys.exit(1)
+if args[0]=='list':
+ print(json.dumps({'success':True,'blocked':[{'filter_id':'filter-1','from':'fixture@spam.example','query':'from:fixture@spam.example'}]}));sys.exit(0)
+if args[0]=='offenders':
+ print(json.dumps({'success':True,'days':30,'sampled':10,'offenders':[{'sender':'news@fixture.example','name':'Fixture News','count':4,'has_unsubscribe':True,'latest_subject':'Synthetic subject'}]}));sys.exit(0)
+if args[0]=='unblock':
+ ok=target!='unverified-filter'
+ print(json.dumps({'success':True,'committed':'--commit' in args,'removed':[target],'unblock_verified':ok}));sys.exit(0)
 if args[0]=='delete':
  ids=[args[n+1] for n,a in enumerate(args[:-1]) if a=='--message-id']
  verified=target!='unverified-delete.test'
- print(json.dumps({'success':True,'committed':True,'target':{'raw':target,'email':None,'host':target,'root_domain':target,'block_mode':'root_domain','is_public_provider':False,'is_multi_tenant_platform':False},'deleted_permanently':len(ids),'already_missing':0,'delete_verified':verified,'remaining':0 if verified else 1,'error':None if ids==['synthetic-message'] and '--purge' not in args else 'Wrong fixture deletion arguments'}));sys.exit(0)
-print(json.dumps({'success':True,'committed':'--commit' in args,'target':{'raw':target,'email':None,'host':target,'root_domain':target,'block_mode':'root_domain','is_public_provider':False,'is_multi_tenant_platform':False},'filter_id':'synthetic-filter','found_messages':[{'id':'synthetic-message','threadId':'synthetic-thread','from':'fixture@spam.example','subject':'Synthetic UI test — no real mail','date':'Wed, 30 Sep 2026','list_unsubscribe':None,'list_unsubscribe_post':None}],'purged':1 if '--purge' in args else 0,'remaining':0 if '--purge' in args else 1}))
+ print(json.dumps({'success':True,'committed':True,'target':{'raw':target,'email':None,'host':target,'root_domain':target,'block_mode':'root_domain','is_public_provider':False,'is_multi_tenant_platform':False},'deleted_permanently':len(ids),'already_missing':0,'delete_verified':verified,'remaining':0 if verified else 1,'error':None if ids==(['id-1','id-2','id-3'] if target=='multi.example' else ['synthetic-message']) and '--purge' not in args else 'Wrong fixture deletion arguments'}));sys.exit(0)
+print(json.dumps({'success':True,'committed':'--commit' in args,'found_total':3 if target=='multi.example' else 1,'history_truncated':target=='multi.example',**({'found_ids':['id-1','id-2','id-3']} if target=='multi.example' else {} if target=='legacy.example' else {'found_ids':['synthetic-message']}),'target':{'raw':target,'email':None,'host':target,'root_domain':target,'block_mode':'root_domain','is_public_provider':False,'is_multi_tenant_platform':False},'filter_id':'synthetic-filter','found_messages':[{'id':'synthetic-message','threadId':'synthetic-thread','from':'fixture@spam.example','subject':'Synthetic UI test — no real mail','date':'Wed, 30 Sep 2026','list_unsubscribe':None,'list_unsubscribe_post':None}],'purged':1 if '--purge' in args else 0,'remaining':0 if '--purge' in args else 1}))

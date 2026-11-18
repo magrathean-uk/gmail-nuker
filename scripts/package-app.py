@@ -83,6 +83,7 @@ def main():
         'CFBundleVersion':'1','LSMinimumSystemVersion':'14.0',
         'LSApplicationCategoryType':'public.app-category.productivity',
         'NSHighResolutionCapable':True,
+        'NSAppleEventsUsageDescription':'Gmail Nuker reads the sender of the message you selected in Mail so it can block it.',
         'NSHumanReadableCopyright':'© 2026 MAGRATHEAN UK LTD. Independent of Google.'
     }))
     run('swift',REPO / 'scripts/make-icon.swift',work / 'AppIcon.iconset')

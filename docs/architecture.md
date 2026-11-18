@@ -4,7 +4,7 @@ The repository contains two front ends to the same Python engine.
 
 - gmail-block is a shell launcher for bin/gmail-block.
 - The Python engine parses a target, signs a delegated service-account assertion, obtains a Google access token, reads filters and message metadata, and optionally performs changes.
-- The SwiftUI app collects a target and calls BlockService, which starts the engine as a subprocess with block --json --commit --include-spam-trash. After confirmation, its wipe uses the separate delete command with the preview's fixed message IDs. BlockViewModel handles the block, prior-mail prompt, permanent deletion, and result states.
+- The SwiftUI app collects a target and calls BlockService, which starts the engine as a subprocess with block --json --commit --include-spam-trash. After confirmation, its wipe uses the separate delete command with every ID the block scan found (`found_ids`, whole history up to the engine cap). The Offender list blocks selected senders sequentially with `--exact`, then deletes per sender after one confirmation; the Blocked list uses `list --json` and `unblock <id> --json --commit` and requires `unblock_verified`. The app runs as a menu bar item (accessory activation policy while no window is open) and a Carbon hot key runs the bundled block-sender.sh for senders read from Mail by AppleScript; that path only moves mail to Trash. BlockViewModel handles the block, prior-mail prompt, permanent deletion, and result states.
 - run.sh opens a colocated app bundle when present or starts the Swift release executable.
 
 Authentication first requests the full configured scope bundle and can retry the base bundle without modify access. Message metadata is fetched individually for the first search page. MX and RDAP lookups inform contact suggestions, not authoritative attribution. Committed operations can unsubscribe, create a filter, purge selected messages, reread state, and send a complaint.
@@ -22,7 +22,11 @@ There is no publisher-operated server or persistent mailbox database. CLI creden
 | bin/gmail-block | Matching, auth, Gmail API, DNS/RDAP, unsubscribe, IMAP, complaints, CLI |
 | app/Sources/GmailBlockApp/BlockService.swift | Python subprocess and JSON decode |
 | app/Sources/GmailBlockApp/BlockViewModel.swift | GUI operation state |
-| app/Sources/GmailBlockApp/ContentView.swift | SwiftUI screens |
+| app/Sources/GmailBlockApp/ContentView.swift | Window shell and section picker |
+| app/Sources/GmailBlockApp/BlockView.swift, OffenderView.swift, BlockedView.swift, SettingsView.swift | Section and Settings screens |
+| app/Sources/GmailBlockApp/BlockViewModel+Lists.swift | Offender list and blocked list actions |
+| app/Sources/GmailBlockApp/MailBlocker.swift | Control-Option-Command-B hot key (Carbon), Mail selection via AppleScript, bundled block-sender.sh |
+| app/Sources/GmailBlockApp/LoginItem.swift | Open at login (SMAppService) |
 | app/Sources/GmailBlockApp/Models.swift | Result decoding |
 | app/Package.swift | Swift build definition |
 | app/engine_launcher.py | In-memory Keychain/1Password and packaged engine bridge |

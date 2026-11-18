@@ -12,9 +12,10 @@ The executable remains named gmail-block within the gmail-nuker repository.
 | Command | Result | Remote writes |
 | --- | --- | --- |
 | block TARGET | Target analysis, filter/mail inventory, DNS/RDAP lookup | With --commit; may unsubscribe automatically |
-| list | Display active Gmail filters | None |
+| list [--json] | Display active Gmail filters (--json: only the TRASH blocks this tool makes, sorted by sender) | None |
 | scan TARGET | Read matching message metadata | None |
-| unblock TARGET | Preview matching filters or supplied filter ID | With --commit, delete selected filters |
+| unblock TARGET [--id-only] [--json] | Preview matching filters or supplied filter ID; --id-only matches a filter ID exactly and never by substring | With --commit, delete selected filters (never touches mail) |
+| offenders [--days 30] [--sample 500] [--json] | Rank recent inbox senders by volume, excluding the mailbox owner and senders already blocked | None |
 | abuse-info TARGET | MX/RDAP contact lookup and report links | No mail sending; performs network lookups |
 
 Passing a target directly is shorthand for block. Supply --sa and --user after the subcommand: the convenience dispatcher currently misinterprets leading global options as a target invocation. This is a known parser limitation.
@@ -34,7 +35,7 @@ Passing a target directly is shorthand for block. Supply --sa and --user after t
 
 --exact narrows an email target to its exact address. Without it, a custom-domain email generally expands to its root domain. Known public webmail providers narrow to the sender; known shared hosting platforms preserve tenant scope. --force-domain overrides those safeguards. Domain parsing is heuristic and does not prove that a sender owns a domain. Preview filter criteria before committing.
 
---limit defaults to 50 for block and scan. The current Gmail search fetches one page of up to 500 message IDs and does not follow nextPageToken. Raising the limit above 500 does not scan the whole mailbox. API purge affects the fetched message IDs; IMAP fallback searches independently and can be broader.
+scan --limit defaults to 50. block scans the whole matching history by default, following nextPageToken up to 5000 IDs (--limit N caps it lower); JSON reports found_ids, found_total and history_truncated. Metadata is fetched only for the first 50 messages, on at most 8 threads. API purge moves every found ID to Trash in batches of 1000; IMAP fallback searches independently and can be broader. delete accepts up to 5000 IDs, checks every sender before deleting anything, and removes in batches of 1000.
 
 --json is accepted on all subcommands by the parser, but structured JSON is implemented for block. Do not treat other commands' output as a stable JSON API. The macOS application decodes block output.
 

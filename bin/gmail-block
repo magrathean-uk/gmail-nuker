@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,6 +63,12 @@ DEFAULT_USER = os.environ.get("GMAIL_BLOCK_USER", "you@example.com")
 SMTP_CREDS_PATH = Path(
     os.environ.get("GMAIL_SMTP_CREDS", "secrets/gmail-smtp.md")
 )
+
+HISTORY_CAP = 5000
+PREVIEW_DETAIL = 50
+MAX_WORKERS = 8
+BATCH_CHUNK = 1000
+OFFENDER_TOP = 50
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -610,56 +617,82 @@ def delete_filter(token: str, filter_id: str) -> None:
 
 # ── Mailbox Message Operations ───────────────────────────────────────────────
 
+def pmap(fn, items: list[Any]) -> list[Any]:
+    """Run fn over items on at most MAX_WORKERS threads, preserving input order."""
+    if not items:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        return list(pool.map(fn, items))
+
+
+def list_message_ids(token: str, query: str, cap: int = HISTORY_CAP, include_spam_trash: bool = False) -> tuple[list[str], bool]:
+    """Page through matching message IDs (Gmail order) up to cap. Returns (ids, truncated)."""
+    ids: list[str] = []
+    page_token = ""
+    while True:
+        url_path = f"users/me/messages?q={urllib.parse.quote(query)}&maxResults={min(max(cap - len(ids), 1), 500)}"
+        if include_spam_trash:
+            url_path += "&includeSpamTrash=true"
+        if page_token:
+            url_path += f"&pageToken={urllib.parse.quote(page_token)}"
+        data = api_call(token, url_path)
+        ids.extend(m["id"] for m in data.get("messages", []) if m.get("id"))
+        page_token = data.get("nextPageToken", "")
+        if len(ids) >= cap:
+            return ids[:cap], bool(page_token) or len(ids) > cap
+        if not page_token:
+            return ids, False
+
+
+def fetch_message_metadata(token: str, mid: str) -> dict[str, Any]:
+    try:
+        detail = api_call(
+            token,
+            f"users/me/messages/{mid}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Unsubscribe-Post",
+        )
+        headers = {
+            h["name"].lower(): h["value"]
+            for h in detail.get("payload", {}).get("headers", [])
+        }
+        return {
+            "id": mid,
+            "threadId": detail.get("threadId"),
+            "from": headers.get("from", ""),
+            "subject": headers.get("subject", "(no subject)"),
+            "date": headers.get("date", ""),
+            "list_unsubscribe": headers.get("list-unsubscribe", ""),
+            "list_unsubscribe_post": headers.get("list-unsubscribe-post", ""),
+            "in_spam_trash": bool({"SPAM", "TRASH"}.intersection(detail.get("labelIds", []))),
+        }
+    except Exception:
+        return {"id": mid, "from": "", "subject": "", "date": "", "list_unsubscribe": "", "list_unsubscribe_post": ""}
+
+
+def scan_mailbox(token: str, query: str, cap: int, detail: int, *, include_spam_trash: bool = False) -> tuple[list[str], list[dict[str, Any]], bool]:
+    """Return (all ids up to cap, metadata for the first `detail` ids, truncated)."""
+    ids, truncated = list_message_ids(token, query, cap, include_spam_trash)
+    details = pmap(lambda mid: fetch_message_metadata(token, mid), ids[:detail])
+    return ids, details, truncated
+
+
 def search_mailbox(token: str, query: str, limit: int = 50, *, include_spam_trash: bool = False) -> list[dict[str, Any]]:
-    url_path = f"users/me/messages?q={urllib.parse.quote(query)}&maxResults={min(limit, 500)}"
-    if include_spam_trash:
-        url_path += "&includeSpamTrash=true"
-    data = api_call(token, url_path)
-    messages = data.get("messages", [])
-    results: list[dict[str, Any]] = []
-    for m in messages[:limit]:
-        mid = m["id"]
-        try:
-            detail = api_call(
-                token,
-                f"users/me/messages/{mid}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Unsubscribe-Post",
-            )
-            headers = {
-                h["name"].lower(): h["value"]
-                for h in detail.get("payload", {}).get("headers", [])
-            }
-            results.append(
-                {
-                    "id": mid,
-                    "threadId": detail.get("threadId"),
-                    "from": headers.get("from", ""),
-                    "subject": headers.get("subject", "(no subject)"),
-                    "date": headers.get("date", ""),
-                    "list_unsubscribe": headers.get("list-unsubscribe", ""),
-                    "list_unsubscribe_post": headers.get("list-unsubscribe-post", ""),
-                    "in_spam_trash": bool({"SPAM", "TRASH"}.intersection(detail.get("labelIds", []))),
-                }
-            )
-        except Exception:
-            results.append({"id": mid, "from": "", "subject": "", "date": "", "list_unsubscribe": "", "list_unsubscribe_post": ""})
-    return results
+    return scan_mailbox(token, query, limit, limit, include_spam_trash=include_spam_trash)[1]
 
 
 def attempt_purge_messages_api(token: str, message_ids: list[str]) -> tuple[int, list[str]]:
-    """Attempts to trash messages via Gmail API batchModify."""
-    if not message_ids:
-        return 0, []
-    try:
-        # Atomic batchModify up to 1,000 messages
-        body = {
-            "ids": message_ids[:1000],
-            "addLabelIds": ["TRASH"],
-            "removeLabelIds": ["INBOX"],
-        }
-        api_call(token, "users/me/messages/batchModify", method="POST", body=body)
-        return len(message_ids[:1000]), []
-    except Exception as e:
-        return 0, [str(e)]
+    """Attempts to trash messages via Gmail API batchModify, in chunks of 1000."""
+    trashed = 0
+    errors: list[str] = []
+    for start in range(0, len(message_ids), BATCH_CHUNK):
+        chunk = message_ids[start:start + BATCH_CHUNK]
+        try:
+            body = {"ids": chunk, "addLabelIds": ["TRASH"], "removeLabelIds": ["INBOX"]}
+            api_call(token, "users/me/messages/batchModify", method="POST", body=body)
+            trashed += len(chunk)
+        except Exception as e:
+            errors.append(str(e))
+            break
+    return trashed, errors
 
 
 def attempt_purge_imap(username: str, app_pw: str, search_target: str) -> tuple[int, str | None]:
@@ -867,9 +900,11 @@ def cmd_block(args: argparse.Namespace) -> int:
 
     # 2. Mailbox scan
     log(f"[2/4] Scanning mailbox for previous messages ({target.search_query}) …")
-    found_messages = search_mailbox(token, target.search_query, limit=args.limit,
-                                    include_spam_trash=getattr(args, "include_spam_trash", False))
-    log(f"  Found {len(found_messages)} previous message(s) in mailbox.")
+    cap = args.limit if getattr(args, "limit", None) else HISTORY_CAP
+    found_ids, found_messages, history_truncated = scan_mailbox(
+        token, target.search_query, cap, PREVIEW_DETAIL,
+        include_spam_trash=getattr(args, "include_spam_trash", False))
+    log(f"  Found {len(found_ids)} previous message(s) in mailbox{' (history cap reached)' if history_truncated else ''}.")
     for idx, m in enumerate(found_messages[:5], 1):
         unsub_note = " [Unsub Header Available]" if m["list_unsubscribe"] else ""
         log(f"    [{idx}] {m['date'][:25]:<25} | {m['from'][:30]:<30} | {m['subject'][:35]}{unsub_note}")
@@ -912,6 +947,9 @@ def cmd_block(args: argparse.Namespace) -> int:
                 "already_active": bool(exact_duplicate),
                 "existing_filter_id": exact_duplicate.get("id") if exact_duplicate else None,
                 "found_messages": found_messages,
+                "found_ids": found_ids,
+                "found_total": len(found_ids),
+                "history_truncated": history_truncated,
                 "abuse_emails": rdap.get("abuse_emails", []),
                 "registrar": rdap.get("registrar", ""),
                 "safe_browsing_url": safe_browsing_url,
@@ -923,7 +961,7 @@ def cmd_block(args: argparse.Namespace) -> int:
         log("=" * 70)
         log("To apply this brutal block, re-run with --commit:")
         log(f"  gmail-block block \"{target.raw}\" --commit")
-        if found_messages:
+        if found_ids:
             log("To also purge existing messages found above:")
             log(f"  gmail-block block \"{target.raw}\" --commit --purge")
         if rdap["abuse_emails"] or esp_info:
@@ -963,9 +1001,9 @@ def cmd_block(args: argparse.Namespace) -> int:
     # Purge existing messages if requested
     purged = 0
     remaining: list[dict[str, Any]] = found_messages
-    if args.purge and found_messages:
-        log(f"[+] Purging {len(found_messages)} existing messages from mailbox …")
-        msg_ids = [m["id"] for m in found_messages]
+    if args.purge and found_ids:
+        log(f"[+] Purging {len(found_ids)} existing messages from mailbox …")
+        msg_ids = list(found_ids)
 
         if has_modify:
             purged, errors = attempt_purge_messages_api(token, msg_ids)
@@ -1043,6 +1081,9 @@ def cmd_block(args: argparse.Namespace) -> int:
             "filter_id": filter_id,
             "already_active": bool(exact_duplicate),
             "found_messages": found_messages,
+            "found_ids": found_ids,
+            "found_total": len(found_ids),
+            "history_truncated": history_truncated,
             "purged": purged,
             "remaining": len(remaining),
             "abuse_emails": rdap.get("abuse_emails", []),
@@ -1062,8 +1103,8 @@ def cmd_delete(args: argparse.Namespace) -> int:
                               "deleted_permanently": 0, "already_missing": 0,
                               "delete_verified": False}
     try:
-        if not ids or len(ids) > 500 or any(not re.fullmatch(r"[A-Za-z0-9_-]+", mid) for mid in ids):
-            raise ValueError("Select between 1 and 500 valid preview message IDs.")
+        if not ids or len(ids) > 5000 or any(not re.fullmatch(r"[A-Za-z0-9_-]+", mid) for mid in ids):
+            raise ValueError("Select between 1 and 5000 valid preview message IDs.")
         target = parse_target(args.target, exact=args.exact, force_domain=args.force_domain)
         result["target"] = {"raw": target.raw, "email": target.email_address, "host": target.host,
                             "root_domain": target.root_domain, "block_mode": target.block_mode,
@@ -1086,8 +1127,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
         selected = []
         # Validate every selected message before issuing any irreversible request.
-        for mid in ids:
-            message = read_message(mid)
+        for mid, message in zip(ids, pmap(read_message, ids)):
             if message is None:
                 result["already_missing"] += 1
                 continue
@@ -1109,9 +1149,11 @@ def cmd_delete(args: argparse.Namespace) -> int:
             result.update(success=True, selected_count=len(selected), remaining=len(selected))
         else:
             if selected:
-                api_call(token, "users/me/messages/batchDelete", method="POST", body={"ids": selected})
+                for start in range(0, len(selected), BATCH_CHUNK):
+                    api_call(token, "users/me/messages/batchDelete", method="POST",
+                             body={"ids": selected[start:start + BATCH_CHUNK]})
             # An empty batchDelete response alone is not proof of deletion.
-            remaining = sum(read_message(mid) is not None for mid in ids)
+            remaining = sum(message is not None for message in pmap(read_message, ids))
             result.update(remaining=remaining, deleted_permanently=max(0, len(selected) - remaining),
                           delete_verified=remaining == 0, success=remaining == 0)
             if remaining:
@@ -1130,14 +1172,33 @@ def cmd_delete(args: argparse.Namespace) -> int:
     return 0 if result["success"] else 1
 
 
+def fail(args: argparse.Namespace, message: str) -> int:
+    if getattr(args, "json", False):
+        print(json.dumps({"success": False, "error": message}))
+    else:
+        print(f"[ERROR] {message}", file=sys.stderr)
+    return 1
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     try:
         token, _ = get_sa_token(args.sa, args.user)
     except Exception as e:
-        print(f"[ERROR] Authentication failed: {e}", file=sys.stderr)
-        return 1
+        return fail(args, f"Authentication failed: {e}")
 
-    filters = list_filters(token)
+    try:
+        filters = list_filters(token)
+    except Exception as e:
+        return fail(args, f"Could not read Gmail filters: {e}")
+    if getattr(args, "json", False):
+        blocked = [
+            {"filter_id": f.get("id", ""), "from": f.get("criteria", {}).get("from", ""),
+             "query": f.get("criteria", {}).get("query", "")}
+            for f in filters if "TRASH" in f.get("action", {}).get("addLabelIds", [])
+        ]
+        blocked.sort(key=lambda b: b["from"].lower())
+        print(json.dumps({"success": True, "blocked": blocked}))
+        return 0
     print(f"Active Gmail Filters for {args.user}: {len(filters)} total")
     print("=" * 80)
     print(f"{'FILTER ID':<36} | {'ACTION':<15} | CRITERIA")
@@ -1158,13 +1219,17 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_unblock(args: argparse.Namespace) -> int:
+    is_json = bool(getattr(args, "json", False))
+    id_only = bool(getattr(args, "id_only", False))
     try:
         token, _ = get_sa_token(args.sa, args.user)
     except Exception as e:
-        print(f"[ERROR] Authentication failed: {e}", file=sys.stderr)
-        return 1
+        return fail(args, f"Authentication failed: {e}")
 
-    filters = list_filters(token)
+    try:
+        filters = list_filters(token)
+    except Exception as e:
+        return fail(args, f"Could not read Gmail filters: {e}")
     matched: list[dict[str, Any]] = []
 
     # Check if target is a filter ID
@@ -1173,7 +1238,7 @@ def cmd_unblock(args: argparse.Namespace) -> int:
             matched.append(f)
 
     # Token/word boundary check to prevent accidental substring deletion
-    if not matched:
+    if not matched and not id_only:
         target_norm = args.target.strip().lower()
         pattern = re.compile(rf"(?i)(?:^|[@.\s(]){re.escape(target_norm)}(?:$|[\s.)>\"'])")
         for f in filters:
@@ -1184,33 +1249,117 @@ def cmd_unblock(args: argparse.Namespace) -> int:
                 matched.append(f)
 
     if not matched:
-        print(f"[-] No matching filter found for target: {args.target}")
+        if is_json:
+            print(json.dumps({"success": False, "committed": False, "removed": [], "unblock_verified": False,
+                              "error": "No matching filter was found. It may already have been removed."}))
+        else:
+            print(f"[-] No matching filter found for target: {args.target}")
         return 1
 
-    print(f"Found {len(matched)} matching filter(s):")
-    for f in matched:
-        print(f"  - ID: {f.get('id')} | Criteria: {f.get('criteria')} | Action: {f.get('action')}")
+    if not is_json:
+        print(f"Found {len(matched)} matching filter(s):")
+        for f in matched:
+            print(f"  - ID: {f.get('id')} | Criteria: {f.get('criteria')} | Action: {f.get('action')}")
 
     if not args.commit:
+        if is_json:
+            print(json.dumps({"success": True, "committed": False,
+                              "removed": [f["id"] for f in matched], "unblock_verified": False}))
+            return 0
         print("\n[DRY RUN] To remove this filter, re-run with --commit:")
         print(f"  gmail-block unblock \"{args.target}\" --commit")
         return 0
 
-    print("\nExecuting unblock (--commit confirmed) …")
-    for f in matched:
-        fid = f["id"]
-        delete_filter(token, fid)
-        print(f"  [✓] Deleted filter {fid}")
+    if not is_json:
+        print("\nExecuting unblock (--commit confirmed) …")
+    removed: list[str] = []
+    try:
+        for f in matched:
+            fid = f["id"]
+            delete_filter(token, fid)
+            removed.append(fid)
+            if not is_json:
+                print(f"  [✓] Deleted filter {fid}")
 
-    # Re-read verification
-    rem = list_filters(token)
+        # Re-read verification
+        rem = list_filters(token)
+    except Exception as e:
+        if is_json:
+            print(json.dumps({"success": False, "committed": True, "removed": removed,
+                              "unblock_verified": False, "error": f"Unblock failed: {e}"}))
+        else:
+            print(f"[ERROR] Unblock failed: {e}", file=sys.stderr)
+        return 1
     deleted_ids = {f["id"] for f in matched}
     still_present = [f for f in rem if f["id"] in deleted_ids]
-    if not still_present:
+    verified = not still_present
+    if is_json:
+        result: dict[str, Any] = {"success": verified, "committed": True, "removed": removed, "unblock_verified": verified}
+        if not verified:
+            result["error"] = f"{len(still_present)} filter(s) still present after removal."
+        print(json.dumps(result))
+        return 0 if verified else 1
+    if verified:
         print("[SUCCESS] All matched filters successfully removed.")
     else:
         print(f"[!] Warning: {len(still_present)} filter(s) still present in live state.", file=sys.stderr)
 
+    return 0
+
+
+def blocked_terms(filters: list[dict[str, Any]]) -> set[str]:
+    """Lower-cased address/domain tokens from the from-criteria of TRASH filters."""
+    terms: set[str] = set()
+    for f in filters:
+        if "TRASH" not in f.get("action", {}).get("addLabelIds", []):
+            continue
+        for tok in re.split(r"[^a-z0-9@._+\-]+", f.get("criteria", {}).get("from", "").lower()):
+            if tok.strip("."):
+                terms.add(tok.strip("."))
+    return terms
+
+
+def cmd_offenders(args: argparse.Namespace) -> int:
+    """Read-only: rank recent inbox senders by volume, excluding the owner and already-blocked senders."""
+    days = max(1, int(args.days))
+    sample = max(1, min(int(args.sample), HISTORY_CAP))
+    try:
+        token, _ = get_sa_token(args.sa, args.user)
+        filters = list_filters(token)
+        ids, _ = list_message_ids(token, f"in:inbox newer_than:{days}d", sample)
+        details = pmap(lambda mid: fetch_message_metadata(token, mid), ids)
+    except Exception as e:
+        return fail(args, f"Could not read the mailbox: {e}")
+    blocked = blocked_terms(filters)
+    owner = args.user.strip().lower()
+    groups: dict[str, dict[str, Any]] = {}
+    for d in details:
+        name, addr = email.utils.parseaddr(d.get("from", ""))
+        addr = addr.strip().lower()
+        if "@" not in addr or addr == owner:
+            continue
+        domain = addr.rsplit("@", 1)[1].strip(".")
+        try:
+            root = extract_root_domain(to_punycode(domain))
+        except Exception:
+            root = domain
+        if {addr, domain, root} & blocked:
+            continue
+        g = groups.setdefault(addr, {"sender": addr, "name": name, "count": 0,
+                                     "has_unsubscribe": False, "latest_subject": d.get("subject", "")})
+        g["count"] += 1
+        if not g["name"] and name:
+            g["name"] = name
+        g["has_unsubscribe"] = g["has_unsubscribe"] or bool(d.get("list_unsubscribe"))
+    offenders = [g for g in groups.values() if g["count"] >= 2]
+    offenders.sort(key=lambda g: (-g["count"], g["sender"]))
+    offenders = offenders[:OFFENDER_TOP]
+    if getattr(args, "json", False):
+        print(json.dumps({"success": True, "days": days, "sampled": len(ids), "offenders": offenders}))
+    else:
+        print(f"Top senders in the last {days} day(s) ({len(ids)} message(s) sampled):")
+        for g in offenders:
+            print(f"{g['count']:>4}  {g['sender']}{'  [unsubscribe]' if g['has_unsubscribe'] else ''}")
     return 0
 
 
@@ -1299,7 +1448,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_block.add_argument("--force-domain", action="store_true", help="Force root-domain block even on public webmail/cloud platforms")
     p_block.add_argument("--purge", action="store_true", help="Also purge existing messages from this target to Trash")
     p_block.add_argument("--report-abuse", action="store_true", help="Dispatch a formal abuse complaint to registrar & Google")
-    p_block.add_argument("--limit", type=int, default=50, help="Cap mailbox scan results (default: 50)")
+    p_block.add_argument("--limit", type=int, default=None, help=f"Cap mailbox scan results (default: whole history, up to {HISTORY_CAP})")
     p_block.add_argument("--include-spam-trash", action="store_true", help="Include Spam and Trash in the message preview")
 
     p_delete = subparsers.add_parser("delete", help="Permanently delete selected preview message IDs", parents=[common_sub])
@@ -1316,8 +1465,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_unblock = subparsers.add_parser("unblock", help="Remove a block filter by ID or target", parents=[common_sub])
     p_unblock.add_argument("target", help="Filter ID or target email/domain to remove")
     p_unblock.add_argument("--commit", action="store_true", help="Actually delete the filter")
+    p_unblock.add_argument("--id-only", action="store_true", help="Match only a filter whose ID equals the target exactly")
 
     # scan
+    p_offenders = subparsers.add_parser("offenders", help="Rank recent inbox senders by volume (read-only)", parents=[common_sub])
+    p_offenders.add_argument("--days", type=int, default=30, help="Look back this many days (default: 30)")
+    p_offenders.add_argument("--sample", type=int, default=500, help="Maximum messages to sample (default: 500)")
+
     p_scan = subparsers.add_parser("scan", help="Scan mailbox for existing messages from target", parents=[common_sub])
     p_scan.add_argument("target", help="Email or domain to search")
     p_scan.add_argument("--exact", action="store_true", help="Search only exact email")
@@ -1337,7 +1491,7 @@ def main() -> int:
     parser = build_parser()
 
     # Convenience: if user runs `gmail-block spammer@bad.com` directly without subcommand
-    if len(sys.argv) > 1 and sys.argv[1] not in {"block", "delete", "list", "unblock", "scan", "abuse-info", "-h", "--help"}:
+    if len(sys.argv) > 1 and sys.argv[1] not in {"block", "delete", "list", "unblock", "offenders", "scan", "abuse-info", "-h", "--help"}:
         sys.argv.insert(1, "block")
 
     args = parser.parse_args()
@@ -1351,6 +1505,8 @@ def main() -> int:
             return cmd_list(args)
         case "unblock":
             return cmd_unblock(args)
+        case "offenders":
+            return cmd_offenders(args)
         case "scan":
             return cmd_scan(args)
         case "abuse-info":
