@@ -226,22 +226,43 @@ def extract_root_domain(host: str) -> str:
     return ".".join(parts[-2:])
 
 
+_ADDRESS_RE = re.compile(r"[^\s@<>\"',;()]+@[^\s@<>\"',;()/]+")
+
+
+def _whole_address(text: str) -> str | None:
+    """Return the lower-cased address if the whole input is one (optionally mailto:, <...> or Name <...>)."""
+    candidate = text.strip().lower()
+    if candidate.startswith("mailto:"):
+        candidate = candidate.removeprefix("mailto:").strip()
+    if "://" in candidate:
+        return None
+    wrapped = re.fullmatch(r"(?:[^<>]*?)<\s*([^<>]+?)\s*>", candidate)
+    if wrapped:
+        candidate = wrapped.group(1)
+    return candidate if _ADDRESS_RE.fullmatch(candidate) else None
+
+
 def parse_target(raw: str, *, exact: bool = False, force_domain: bool = False) -> TargetInfo:
     cleaned = raw.strip()
+    whole_address = _whole_address(cleaned)
+    if whole_address:
+        cleaned = whole_address
+    else:
+        if exact and "@" in cleaned and "://" not in cleaned:
+            raise ValueError("The sender address is not a valid single email address.")
+        # Strip scheme and path if URL is provided
+        if "://" in cleaned:
+            parsed_url = urllib.parse.urlsplit(cleaned)
+            cleaned = parsed_url.hostname or cleaned
+        elif "/" in cleaned:
+            cleaned = cleaned.split("/", 1)[0]
 
-    # Strip scheme and path if URL is provided
-    if "://" in cleaned:
-        parsed_url = urllib.parse.urlsplit(cleaned)
-        cleaned = parsed_url.hostname or cleaned
-    elif "/" in cleaned:
-        cleaned = cleaned.split("/", 1)[0]
-
-    cleaned = cleaned.lower()
-    if cleaned.startswith("mailto:"):
-        cleaned = cleaned.removeprefix("mailto:").strip()
+        cleaned = cleaned.lower()
+        if cleaned.startswith("mailto:"):
+            cleaned = cleaned.removeprefix("mailto:").strip()
 
     # Extract email from possible display names: e.g. "Spammer" <user@domain.com>
-    _, email_candidate = email.utils.parseaddr(cleaned)
+    _, email_candidate = ("", cleaned) if whole_address else email.utils.parseaddr(cleaned)
     if "@" in email_candidate and bool(email_candidate.split("@", 1)[0].strip()):
         cleaned = email_candidate
     else:
@@ -846,7 +867,13 @@ def cmd_block(args: argparse.Namespace) -> int:
         if not is_json:
             print(*a, **kw)
 
-    target = parse_target(args.target, exact=args.exact, force_domain=args.force_domain)
+    limit = getattr(args, "limit", None)
+    if limit is not None and not 1 <= limit <= HISTORY_CAP:
+        return fail(args, f"--limit must be between 1 and {HISTORY_CAP}.")
+    try:
+        target = parse_target(args.target, exact=args.exact, force_domain=args.force_domain)
+    except ValueError as error:
+        return fail(args, str(error))
     log("=" * 70)
     log("  GMAIL NUCLEAR BLOCKER  --  TARGET ANALYSIS")
     log("=" * 70)
@@ -900,7 +927,7 @@ def cmd_block(args: argparse.Namespace) -> int:
 
     # 2. Mailbox scan
     log(f"[2/4] Scanning mailbox for previous messages ({target.search_query}) …")
-    cap = args.limit if getattr(args, "limit", None) else HISTORY_CAP
+    cap = HISTORY_CAP if limit is None else limit
     found_ids, found_messages, history_truncated = scan_mailbox(
         token, target.search_query, cap, PREVIEW_DETAIL,
         include_spam_trash=getattr(args, "include_spam_trash", False))
@@ -1126,6 +1153,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
                 raise
 
         selected = []
+        batch_error = ""
         # Validate every selected message before issuing any irreversible request.
         for mid, message in zip(ids, pmap(read_message, ids)):
             if message is None:
@@ -1150,13 +1178,20 @@ def cmd_delete(args: argparse.Namespace) -> int:
         else:
             if selected:
                 for start in range(0, len(selected), BATCH_CHUNK):
-                    api_call(token, "users/me/messages/batchDelete", method="POST",
-                             body={"ids": selected[start:start + BATCH_CHUNK]})
+                    try:
+                        api_call(token, "users/me/messages/batchDelete", method="POST",
+                                 body={"ids": selected[start:start + BATCH_CHUNK]})
+                    except Exception as error:
+                        batch_error = f"A deletion batch failed ({error})."
+                        break
             # An empty batchDelete response alone is not proof of deletion.
             remaining = sum(message is not None for message in pmap(read_message, ids))
             result.update(remaining=remaining, deleted_permanently=max(0, len(selected) - remaining),
                           delete_verified=remaining == 0, success=remaining == 0)
-            if remaining:
+            if batch_error:
+                result.update(success=False, delete_verified=False,
+                              error=f"{batch_error} {remaining} selected message(s) are still present.")
+            elif remaining:
                 result["error"] = f"Permanent deletion could not be verified: {remaining} selected message(s) are still present."
     except Exception as error:
         result["error"] = str(error)
@@ -1180,6 +1215,14 @@ def fail(args: argparse.Namespace, message: str) -> int:
     return 1
 
 
+def is_tool_filter(f: dict[str, Any]) -> bool:
+    """True only for filters in the shape this tool creates: from-only criteria, TRASH added and INBOX removed."""
+    crit = f.get("criteria", {})
+    act = f.get("action", {})
+    return (bool(str(crit.get("from", "")).strip()) and set(crit) == {"from"}
+            and "TRASH" in act.get("addLabelIds", []) and "INBOX" in act.get("removeLabelIds", []))
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     try:
         token, _ = get_sa_token(args.sa, args.user)
@@ -1194,7 +1237,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         blocked = [
             {"filter_id": f.get("id", ""), "from": f.get("criteria", {}).get("from", ""),
              "query": f.get("criteria", {}).get("query", "")}
-            for f in filters if "TRASH" in f.get("action", {}).get("addLabelIds", [])
+            for f in filters if is_tool_filter(f)
         ]
         blocked.sort(key=lambda b: b["from"].lower())
         print(json.dumps({"success": True, "blocked": blocked}))
@@ -1247,6 +1290,9 @@ def cmd_unblock(args: argparse.Namespace) -> int:
             q_str = crit.get("query", "").lower()
             if pattern.search(from_str) or pattern.search(q_str) or target_norm in {from_str, q_str}:
                 matched.append(f)
+
+    if id_only and matched and not all(is_tool_filter(f) for f in matched):
+        return fail(args, "That filter was not created by this tool, so it was not removed.")
 
     if not matched:
         if is_json:

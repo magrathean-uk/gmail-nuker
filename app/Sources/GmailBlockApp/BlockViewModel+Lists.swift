@@ -1,5 +1,10 @@
 import Foundation
 
+private enum ListError: LocalizedError {
+    case accountChanged
+    var errorDescription: String? { "Account changed; scan again." }
+}
+
 /// Offender list and blocked list actions. Each one holds the busy flag so the app cannot quit mid-way.
 extension BlockViewModel {
     func scanInbox() async {
@@ -7,7 +12,11 @@ extension BlockViewModel {
         isBusy = true
         offenderPhase = .scanning
         do {
-            offenderList = try await service.offenders(days: 30)
+            let key = Self.currentKey
+            let found = try await service.offenders(days: 30)
+            guard key == Self.currentKey else { throw ListError.accountChanged }
+            offenderList = found
+            offenderKey = key
             selectedOffenders = []
             hasScanned = true
             offenderPhase = .idle
@@ -22,10 +31,23 @@ extension BlockViewModel {
         guard !isBusy else { return }
         let senders = offenderList.filter { selectedOffenders.contains($0.id) }.map(\.sender)
         guard !senders.isEmpty else { return }
+        guard offenderKey == Self.currentKey else {
+            offenderList = []; selectedOffenders = []; hasScanned = false
+            offenderPhase = .error(Self.accountChanged)
+            return
+        }
         isBusy = true
         var previews: [SenderPreview] = []
         for (index, sender) in senders.enumerated() {
             offenderPhase = .blocking("Blocking \(index + 1) of \(senders.count): \(sender)")
+            if offenderKey != Self.currentKey {
+                previews.append(SenderPreview(sender: sender, result: nil, error: Self.accountChanged))
+                continue
+            }
+            if !Self.isPlainAddress(sender) {
+                previews.append(SenderPreview(sender: sender, result: nil, error: "Not a plain email address, so it was skipped."))
+                continue
+            }
             do {
                 let result = try await service.executeBlock(target: sender, exact: true, commit: true, purge: false, includeSpamTrash: true)
                 previews.append(SenderPreview(sender: sender, result: result, error: nil))
@@ -46,11 +68,19 @@ extension BlockViewModel {
     /// Deletes per sender; one failure never hides the others' results.
     func deleteOffenderMail(_ previews: [SenderPreview]) async {
         guard !isBusy else { return }
+        guard offenderKey == Self.currentKey else {
+            offenderPhase = .error(Self.accountChanged)
+            return
+        }
         isBusy = true
         var deleted: [String: Result<Int, Error>] = [:]
         let targets = previews.filter { $0.result != nil && $0.count > 0 }
         for (index, preview) in targets.enumerated() {
             offenderPhase = .deleting("Deleting \(index + 1) of \(targets.count): \(preview.sender)")
+            if offenderKey != Self.currentKey {
+                deleted[preview.sender] = .failure(ListError.accountChanged)
+                continue
+            }
             do {
                 let outcome = try await service.deletePrevious(result: preview.result!)
                 deleted[preview.sender] = .success(outcome.deleted_permanently ?? 0)
@@ -82,6 +112,13 @@ extension BlockViewModel {
         offenderPhase = .done(outcomes)
     }
 
+    /// One @, no slash, no whitespace: the only shape an exact block can keep intact.
+    static func isPlainAddress(_ value: String) -> Bool {
+        let parts = value.split(separator: "@", omittingEmptySubsequences: false)
+        return parts.count == 2 && !parts[0].isEmpty && parts[1].contains(".")
+            && !value.contains("/") && value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+    }
+
     static func messages(_ count: Int) -> String { count == 1 ? "message" : "messages" }
 
     func loadBlocked() async {
@@ -89,14 +126,24 @@ extension BlockViewModel {
         isBusy = true
         blockedLoading = true
         blockedError = nil
-        do { blockedList = try await service.listBlocked() }
-        catch { blockedError = error.localizedDescription }
+        let key = Self.currentKey
+        do {
+            let list = try await service.listBlocked()
+            guard key == Self.currentKey else { throw ListError.accountChanged }
+            blockedList = list
+            blockedKey = key
+        } catch { blockedError = error.localizedDescription }
         blockedLoading = false
         isBusy = false
     }
 
     func unblock(_ filter: BlockedFilter) async {
         guard !isBusy else { return }
+        guard blockedKey == Self.currentKey else {
+            blockedList = []
+            blockedError = Self.accountChanged
+            return
+        }
         isBusy = true
         blockedError = nil
         blockedMessage = nil

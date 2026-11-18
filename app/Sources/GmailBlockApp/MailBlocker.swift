@@ -1,11 +1,19 @@
 import AppKit
 import Carbon.HIToolbox
+import Observation
 
 /// Block the sender of the message selected in Mail, via the bundled block-sender.sh
 /// (exact sender, existing mail to Trash only, notification when done).
+/// Observable so the Quit menu items and the quit guard can see a Mail block in progress.
+@Observable
+@MainActor
+final class MailState {
+    static let shared = MailState()
+    var running = false
+}
+
 @MainActor
 enum MailBlocker {
-    private static var running = false
     private static var hotKey: EventHotKeyRef?
 
     /// Control-Option-Command-B. Carbon hot keys need no Accessibility permission.
@@ -21,11 +29,11 @@ enum MailBlocker {
     }
 
     static func blockSelected() {
-        guard !running else { return }
-        running = true
+        guard !MailState.shared.running else { return }
+        MailState.shared.running = true
         Task {
             await perform()
-            running = false
+            MailState.shared.running = false
         }
     }
 
@@ -61,35 +69,38 @@ private enum MailWork {
         process.waitUntilExit()
     }
 
+    /// Reads Mail's selection through /usr/bin/osascript (no sender data is ever put into the script).
     static func selectedSenders() -> Result<[String], MailError> {
-        let source = """
-        tell application "Mail"
-            set out to {}
-            repeat with m in (selection)
-                set end of out to (sender of m)
-            end repeat
-            return out
-        end tell
-        """
-        guard let script = NSAppleScript(source: source) else { return .failure(MailError(message: "Could not read Mail.")) }
-        var failure: NSDictionary?
-        let descriptor = script.executeAndReturnError(&failure)
-        if let failure {
-            let code = failure[NSAppleScript.errorNumber] as? Int
-            return .failure(MailError(message: code == -1743
+        let lines = ["tell application \"Mail\"", "set out to {}", "repeat with m in (selection)",
+                     "set end of out to (sender of m)", "end repeat", "set AppleScript's text item delimiters to linefeed",
+                     "return out as text", "end tell"]
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = lines.flatMap { ["-e", $0] }
+        let output = Pipe(), errors = Pipe()
+        process.standardOutput = output
+        process.standardError = errors
+        guard (try? process.run()) != nil else { return .failure(MailError(message: "Could not read Mail.")) }
+        let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: timeout)
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let errorText = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        process.waitUntilExit()
+        timeout.cancel()
+        if process.terminationReason == .uncaughtSignal {
+            return .failure(MailError(message: "Mail did not answer in time. Try again."))
+        }
+        guard process.terminationStatus == 0 else {
+            return .failure(MailError(message: errorText.contains("-1743")
                 ? "Allow Gmail Nuker to control Mail in System Settings, Privacy & Security, Automation."
                 : "Could not read the selected message in Mail."))
         }
-        var senders: [String] = []
-        if descriptor.numberOfItems > 0 {
-            for index in 1...descriptor.numberOfItems {
-                if let value = descriptor.atIndex(index)?.stringValue { senders.append(value) }
-            }
-        } else if let value = descriptor.stringValue {
-            senders.append(value)
-        }
+        let text = String(data: data, encoding: .utf8) ?? ""
         var seen = Set<String>()
-        return .success(senders.filter { !$0.isEmpty && seen.insert($0).inserted })
+        let senders = text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+        return .success(senders)
     }
 
     static func block(_ sender: String) {

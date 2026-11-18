@@ -68,6 +68,16 @@ public final class BlockViewModel {
 
     let service: BlockService
 
+    /// Mailbox and key source the current results came from; writes are refused if they change.
+    var offenderKey = ""
+    var blockedKey = ""
+    var previewKey = ""
+    static let accountChanged = "Account changed; scan again."
+    static var currentKey: String {
+        let account = AccountConfiguration.load()
+        return account.mailbox.lowercased() + "|" + account.effectiveSource
+    }
+
     public init(service: BlockService = BlockService()) {
         self.service = service
     }
@@ -82,6 +92,7 @@ public final class BlockViewModel {
         currentPhase = .blocking
 
         do {
+            previewKey = Self.currentKey
             let result = try await service.executeBlock(target: trimmed, exact: false, commit: true, purge: false, includeSpamTrash: true)
             isBusy = false
             currentPhase = .blockedPromptWipe(result)
@@ -93,6 +104,10 @@ public final class BlockViewModel {
 
     public func wipePrevious(result: BlockResult) async {
         guard !isBusy else { return }
+        guard previewKey == Self.currentKey else {
+            operationError = "Account changed; block the sender again."
+            return
+        }
         isBusy = true
         operationError = nil
         currentPhase = .purging(result)
@@ -122,7 +137,11 @@ public final class BlockViewModel {
     }
 
     func refreshAccount() {
+        let before = account
         account = AccountConfiguration.load()
+        if account.mailbox.lowercased() != before.mailbox.lowercased() || account.effectiveSource != before.effectiveSource {
+            clearMailboxState()
+        }
         connectionChecked = false
     }
 
@@ -139,5 +158,21 @@ public final class BlockViewModel {
             currentPhase = .error(error.localizedDescription)
         }
         isBusy = false
+    }
+
+    /// Forget everything that came from the previous mailbox or key.
+    private func clearMailboxState() {
+        offenderList = []
+        selectedOffenders = []
+        hasScanned = false
+        offenderKey = ""
+        blockedList = []
+        blockedKey = ""
+        blockedMessage = nil
+        blockedError = nil
+        if !isBusy {
+            offenderPhase = .idle
+            if case .blockedPromptWipe = currentPhase { currentPhase = .input }
+        }
     }
 }

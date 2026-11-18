@@ -43,7 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if viewModel.isBusy {
+        if viewModel.isBusy || MailState.shared.running {
             NSSound.beep()
             return .terminateCancel
         }
@@ -69,7 +69,7 @@ struct GmailBlockApp: App {
             }
             CommandGroup(replacing: .appTermination) {
                 Button("Quit Gmail Nuker") { NSApplication.shared.terminate(nil) }
-                    .keyboardShortcut("q").disabled(viewModel.isBusy)
+                    .keyboardShortcut("q").disabled(viewModel.isBusy || MailState.shared.running)
             }
         }
         Settings { AccountSettingsView(viewModel: viewModel) }
@@ -98,7 +98,7 @@ struct MenuContent: View {
         }
         Divider()
         Button("Quit Gmail Nuker") { NSApplication.shared.terminate(nil) }
-            .disabled(viewModel.isBusy)
+            .disabled(viewModel.isBusy || MailState.shared.running)
     }
 
     private func show(_ section: AppSection?) {

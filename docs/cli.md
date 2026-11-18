@@ -12,9 +12,9 @@ The executable remains named gmail-block within the gmail-nuker repository.
 | Command | Result | Remote writes |
 | --- | --- | --- |
 | block TARGET | Target analysis, filter/mail inventory, DNS/RDAP lookup | With --commit; may unsubscribe automatically |
-| list [--json] | Display active Gmail filters (--json: only the TRASH blocks this tool makes, sorted by sender) | None |
+| list [--json] | Display active Gmail filters (--json: only from-only filters in this tool's own TRASH+skip-Inbox shape, sorted by sender) | None |
 | scan TARGET | Read matching message metadata | None |
-| unblock TARGET [--id-only] [--json] | Preview matching filters or supplied filter ID; --id-only matches a filter ID exactly and never by substring | With --commit, delete selected filters (never touches mail) |
+| unblock TARGET [--id-only] [--json] | Preview matching filters or supplied filter ID; --id-only matches a filter ID exactly, never by substring, and refuses filters not made by this tool | With --commit, delete selected filters (never touches mail) |
 | offenders [--days 30] [--sample 500] [--json] | Rank recent inbox senders by volume, excluding the mailbox owner and senders already blocked | None |
 | abuse-info TARGET | MX/RDAP contact lookup and report links | No mail sending; performs network lookups |
 

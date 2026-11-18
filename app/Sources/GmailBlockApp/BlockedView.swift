@@ -45,11 +45,11 @@ struct BlockedView: View {
             }
         }
         .task { if viewModel.account.isConfigured { await viewModel.loadBlocked() } }
-        .alert("Unblock \(pending?.from ?? "")?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }), presenting: pending) { filter in
+        .alert("Unblock this sender?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }), presenting: pending) { filter in
             Button("Cancel", role: .cancel) {}
             Button("Unblock") { Task { await viewModel.unblock(filter) } }
-        } message: { _ in
-            Text("Their future mail will arrive normally again. Mail already deleted stays deleted.")
+        } message: {
+            Text("Unblock \($0.from)? Their future mail will arrive normally again. Mail already deleted stays deleted.")
         }
     }
 }

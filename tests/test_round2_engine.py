@@ -148,6 +148,25 @@ class Delete(unittest.TestCase):
         sizes = [len(c[2]['ids']) for c in self.calls if c[1].endswith('batchDelete')]
         self.assertEqual(sizes, [1000] * 5)
 
+    def test_later_chunk_failure_still_reports_verified_state(self):
+        real = self.api
+        count = {'n': 0}
+
+        def api(token, path, method='GET', body=None, **kw):
+            if path.endswith('batchDelete'):
+                count['n'] += 1
+                if count['n'] == 2:
+                    raise engine.GmailAPIError(500, 'boom')
+            return real(token, path, method, body, **kw)
+        ids = list(self.store)[:2500]
+        with patch.object(engine, 'api_call', side_effect=api):
+            code, res = run(engine.cmd_delete, target='a@spam.example', message_id=ids, commit=True,
+                            exact=True, force_domain=False)
+        self.assertEqual(code, 1)
+        self.assertFalse(res['success'])
+        self.assertEqual((res['deleted_permanently'], res['remaining']), (1000, 1500))
+        self.assertIn('batch failed', res['error'])
+
     def test_rejects_more_than_5000(self):
         ids = [f'x{i}' for i in range(5001)]
         code, res = self.delete(ids)
@@ -163,9 +182,13 @@ class Delete(unittest.TestCase):
 
 
 class Filters(unittest.TestCase):
+    TOOL = {'addLabelIds': ['TRASH'], 'removeLabelIds': ['INBOX', 'UNREAD', 'IMPORTANT']}
     filters = [
-        {'id': 'f1', 'criteria': {'from': 'Zed@x.example'}, 'action': {'addLabelIds': ['TRASH']}},
-        {'id': 'f2', 'criteria': {'from': 'alpha.example'}, 'action': {'addLabelIds': ['TRASH'], 'removeLabelIds': ['INBOX']}},
+        {'id': 'f1', 'criteria': {'from': 'Zed@x.example'}, 'action': TOOL},
+        {'id': 'f2', 'criteria': {'from': 'alpha.example'}, 'action': TOOL},
+        {'id': 'f5', 'criteria': {'subject': 'sale'}, 'action': TOOL},
+        {'id': 'f6', 'criteria': {'from': 'a@b.example', 'subject': 'sale'}, 'action': TOOL},
+        {'id': 'f7', 'criteria': {'from': 'c@b.example'}, 'action': {'addLabelIds': ['TRASH']}},
         {'id': 'f3', 'criteria': {'from': 'skip@x.example'}, 'action': {'addLabelIds': ['STARRED']}},
         {'id': 'f4', 'criteria': {'from': 'bob@x.example'}, 'action': {'removeLabelIds': ['INBOX']}},
     ]
@@ -205,6 +228,13 @@ class Filters(unittest.TestCase):
         code, res, deleted = self.unblock('f2')
         self.assertEqual((code, res['committed'], res['removed']), (0, False, ['f2']))
         self.assertEqual(deleted, [])
+
+    def test_unblock_refuses_non_tool_filter(self):
+        for fid in ('f5', 'f6', 'f7'):
+            code, res, deleted = self.unblock(fid, commit=True)
+            self.assertEqual(code, 1, fid)
+            self.assertFalse(res['success'])
+            self.assertEqual(deleted, [])
 
     def test_unverified_when_filter_persists(self):
         state = list(self.filters)
@@ -247,6 +277,42 @@ class Offenders(unittest.TestCase):
         promo = res['offenders'][1]
         self.assertEqual((promo['name'], promo['has_unsubscribe']), ('Promo', True))
         self.assertEqual(set(promo), {'sender', 'name', 'count', 'has_unsubscribe', 'latest_subject'})
+
+
+class ParseTarget(unittest.TestCase):
+    def test_slash_in_local_part_is_not_truncated(self):
+        t = engine.parse_target('promo/sales@example.com', exact=True)
+        self.assertEqual(t.email_address, 'promo/sales@example.com')
+        self.assertEqual(t.search_query, 'from:promo/sales@example.com')
+        self.assertEqual(engine.parse_target('<A/B@Example.com>').email_address, 'a/b@example.com')
+
+    def test_urls_still_reduce_to_host(self):
+        self.assertEqual(engine.parse_target('https://news.example.com/path/x').host, 'news.example.com')
+        self.assertEqual(engine.parse_target('example.com/path').host, 'example.com')
+
+    def test_exact_rejects_non_address_with_at(self):
+        with self.assertRaises(ValueError):
+            engine.parse_target('two words@example.com', exact=True)
+
+
+class BlockLimit(unittest.TestCase):
+    def test_invalid_limits_rejected_before_any_call(self):
+        for limit in (0, -1, 5001):
+            with patch.object(engine, 'get_sa_token', side_effect=forbidden):
+                code, res = run(engine.cmd_block, target='a@b.example', exact=True, force_domain=False,
+                                limit=limit, commit=True, purge=True, report_abuse=False)
+            self.assertEqual(code, 1)
+            self.assertFalse(res['success'])
+
+    def test_omitted_limit_uses_history_cap(self):
+        with patch.object(engine, 'list_filters', return_value=[]), \
+             patch.object(engine, 'scan_mailbox', return_value=([], [], False)) as scan, \
+             patch.object(engine, 'resolve_mx_records', return_value=[]), \
+             patch.object(engine, 'lookup_rdap_abuse', return_value={'registrar': '', 'abuse_emails': []}):
+            code, res = run(engine.cmd_block, target='a@b.example', exact=True, force_domain=False,
+                            limit=None, commit=False, purge=False, report_abuse=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(scan.call_args.args[2], engine.HISTORY_CAP)
 
 
 class Launcher(unittest.TestCase):
