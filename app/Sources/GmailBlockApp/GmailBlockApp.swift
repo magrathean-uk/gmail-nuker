@@ -77,9 +77,15 @@ struct GmailBlockApp: App {
         MenuBarExtra {
             MenuContent(viewModel: viewModel)
         } label: {
-            // Hourglass while a Mail block is running, so a click always shows it was received.
-            Image(systemName: MailState.shared.running ? "hourglass" : "envelope.badge.shield.half.filled")
+            MenuBarIcon()
         }
+    }
+}
+
+/// Hourglass while a Mail block is running, so a click always shows it was received.
+struct MenuBarIcon: View {
+    var body: some View {
+        Image(systemName: MailState.shared.running ? "hourglass" : "envelope.badge.shield.half.filled")
     }
 }
 

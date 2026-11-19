@@ -121,6 +121,9 @@ private enum MailWork {
         process.standardOutput = output
         process.standardError = errors
         guard (try? process.run()) != nil else { return .failure(MailError(message: "Could not start the block script.")) }
+        // A stalled engine (for example an unanswered 1Password prompt) must not leave the block running forever.
+        let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 600, execute: watchdog)
         // Drain stderr alongside stdout so neither pipe can fill and stall the script.
         let group = DispatchGroup()
         nonisolated(unsafe) var errorText = Data()
@@ -129,6 +132,10 @@ private enum MailWork {
         let outText = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         group.wait()
         process.waitUntilExit()
+        watchdog.cancel()
+        if process.terminationReason == .uncaughtSignal {
+            return .failure(MailError(message: "The block took longer than 10 minutes and was stopped. Try again."))
+        }
         if process.terminationStatus == 0, let result = MailBlockResult.parse(outText) { return .success(result) }
         let message = (String(data: errorText, encoding: .utf8) ?? "")
             .split(whereSeparator: \.isNewline).last.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""

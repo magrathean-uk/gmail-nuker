@@ -68,6 +68,7 @@ if printf '%s' "$out" | /usr/bin/grep -q '"success": *true'; then
   echo "blocked $addr ${moved:-0}"
 else
   msg="$(printf '%s' "$out" | /usr/bin/sed -n 's/.*"error": *"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$msg" ] || msg="$(printf '%s\n' "$out" | /usr/bin/grep -v '^[[:space:]]*$' | tail -1)"
   notify "Block failed" "${msg:-See engine output.}"
   echo "${msg:-The block did not finish. Check Settings and try again.}" >&2
   exit 1

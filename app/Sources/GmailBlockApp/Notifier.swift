@@ -17,8 +17,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// `important` results fall back to an alert when banners are off; progress notices do not.
     func post(_ title: String, _ body: String, important: Bool = true) async {
         let center = UNUserNotificationCenter.current()
-        let status = await center.notificationSettings().authorizationStatus
-        if status == .authorized || status == .provisional {
+        let settings = await center.notificationSettings()
+        // Provisional or alert style None would post without showing anything, so those use the alert.
+        if settings.authorizationStatus == .authorized && settings.alertSetting == .enabled {
             let content = UNMutableNotificationContent()
             content.title = title
             content.body = body
