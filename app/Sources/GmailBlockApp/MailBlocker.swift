@@ -29,7 +29,10 @@ enum MailBlocker {
     }
 
     static func blockSelected() {
-        guard !MailState.shared.running else { return }
+        guard !MailState.shared.running else {
+            Task { await Notifier.shared.post("Still working", "The previous block is still running. Try again when it finishes.", important: false) }
+            return
+        }
         MailState.shared.running = true
         Task {
             await perform()
@@ -38,19 +41,29 @@ enum MailBlocker {
     }
 
     private static func perform() async {
+        let notifier = Notifier.shared
         let mail = "com.apple.mail"
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: mail).isEmpty else {
-            await Task.detached { MailWork.notify("Select a message in Mail first.") }.value
+            await notifier.post("Nothing to block", "Open Mail, select a message, then try again.")
             return
         }
         let senders = await Task.detached { MailWork.selectedSenders() }.value
         switch senders {
         case .failure(let error):
-            await Task.detached { MailWork.notify(error.message) }.value
+            await notifier.post("Block failed", error.message)
         case .success(let list) where list.isEmpty:
-            await Task.detached { MailWork.notify("Select a message in Mail first.") }.value
+            await notifier.post("Nothing to block", "Select a message in Mail, then try again.")
         case .success(let list):
-            for sender in list { await Task.detached { MailWork.block(sender) }.value }
+            for sender in list {
+                await notifier.post("Blocking sender", "\(sender). This can take a minute.", important: false)
+                switch await Task.detached(operation: { MailWork.block(sender) }).value {
+                case .success(let done):
+                    let moved = done.moved == 1 ? "1 message" : "\(done.moved) messages"
+                    await notifier.post("Blocked \(done.address)", "Future mail from this sender goes to Trash. \(moved) moved to Trash.")
+                case .failure(let error):
+                    await notifier.post("Block failed for \(sender)", error.message)
+                }
+            }
         }
     }
 }
@@ -59,16 +72,6 @@ private struct MailError: Error, Sendable { let message: String }
 
 /// Blocking work (AppleScript, subprocesses); always called off the main actor.
 private enum MailWork {
-    static func notify(_ message: String, title: String = "Block sender") {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", "on run a", "-e", "display notification (item 2 of a) with title (item 1 of a)", "-e", "end run", title, message]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
-        process.waitUntilExit()
-    }
-
     /// Reads Mail's selection through /usr/bin/osascript (no sender data is ever put into the script).
     static func selectedSenders() -> Result<[String], MailError> {
         let lines = ["tell application \"Mail\"", "set out to {}", "repeat with m in (selection)",
@@ -103,17 +106,32 @@ private enum MailWork {
         return .success(senders)
     }
 
-    static func block(_ sender: String) {
+    /// Runs the bundled block-sender.sh with its own notifications off; the app reports the result.
+    static func block(_ sender: String) -> Result<MailBlockResult, MailError> {
         guard let script = Bundle.main.url(forResource: "block-sender", withExtension: "sh") else {
-            notify("The block script is missing from the app.")
-            return
+            return .failure(MailError(message: "The block script is missing from the app. Reinstall Gmail Nuker."))
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [script.path, sender]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run(); process.waitUntilExit() }
-        catch { notify("Could not start the block script.") }
+        var environment = ProcessInfo.processInfo.environment
+        environment["GMAIL_NUKER_NO_NOTIFY"] = "1"
+        process.environment = environment
+        let output = Pipe(), errors = Pipe()
+        process.standardOutput = output
+        process.standardError = errors
+        guard (try? process.run()) != nil else { return .failure(MailError(message: "Could not start the block script.")) }
+        // Drain stderr alongside stdout so neither pipe can fill and stall the script.
+        let group = DispatchGroup()
+        nonisolated(unsafe) var errorText = Data()
+        group.enter()
+        DispatchQueue.global().async { errorText = errors.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        let outText = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        group.wait()
+        process.waitUntilExit()
+        if process.terminationStatus == 0, let result = MailBlockResult.parse(outText) { return .success(result) }
+        let message = (String(data: errorText, encoding: .utf8) ?? "")
+            .split(whereSeparator: \.isNewline).last.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
+        return .failure(MailError(message: message.isEmpty ? "The block did not finish. Check Settings and try again." : message))
     }
 }

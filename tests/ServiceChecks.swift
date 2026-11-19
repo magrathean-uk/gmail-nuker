@@ -55,6 +55,10 @@ import Foundation
    if !result.success {failed.append("large pipes")}
    else {print("PASS large stdout and stderr are drained without deadlock")}
   } catch {failed.append("large pipes")}
+  if MailBlockResult.parse("blocked a@b.test 12\n") == MailBlockResult(address:"a@b.test",moved:12),
+     MailBlockResult.parse("blocked a@b.test\n")?.moved == 0,
+     MailBlockResult.parse("failed\n") == nil {print("PASS Mail block result line parses")}
+  else {failed.append("mail result parse")}
   if !failed.isEmpty {print("FAIL incorrectly accepted: \(failed.joined(separator:", "))");exit(1)}
  }
 }

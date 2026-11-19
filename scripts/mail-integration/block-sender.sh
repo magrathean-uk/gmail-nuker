@@ -7,7 +7,12 @@ APP="/Applications/Gmail Nuker.app"
 ENGINE="$APP/Contents/Resources/Engine/gmail-nuker-engine"
 DOM="uk.magrathean.gmail-nuker"
 
-notify() { /usr/bin/osascript -e 'on run a' -e 'display notification (item 2 of a) with title (item 1 of a)' -e 'end run' "$1" "$2" >/dev/null 2>&1; }
+# GMAIL_NUKER_NO_NOTIFY=1: the caller (the app) shows the result itself from stdout/stderr and the exit code.
+notify() {
+  [ "${GMAIL_NUKER_NO_NOTIFY:-}" = 1 ] && return 0
+  /usr/bin/osascript -e 'on run a' -e 'display notification (item 2 of a) with title (item 1 of a)' -e 'end run' "$1" "$2" >/dev/null 2>&1
+}
+fail() { echo "$1" >&2; notify "Block sender" "$1"; exit 1; }
 
 raw="${1:-}"
 trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; printf '%s' "${v%"${v##*[![:space:]]}"}"; }
@@ -18,7 +23,7 @@ if [[ "$raw" == *"<"*">"* ]]; then
 else
   candidate="$(trim "$raw")"
 fi
-[[ "$candidate" =~ $addr_re ]] || { notify "Block sender" "Could not read a single sender address."; exit 1; }
+[[ "$candidate" =~ $addr_re ]] || fail "Could not read a single sender address."
 addr="$(printf '%s' "$candidate" | tr 'A-Z' 'a-z')"
 
 # Saved app settings first, then the bundled configuration of a preconfigured build.
@@ -48,9 +53,9 @@ if [ -n "$mailbox" ]; then
     [ "${ref#op://}" != "$ref" ] && configured=1
   fi
 fi
-[ "$configured" = 1 ] || { notify "Block sender" "Gmail Nuker is not configured. Open the app Settings."; exit 1; }
-[ "$addr" != "$(printf '%s' "$mailbox" | tr 'A-Z' 'a-z')" ] || { notify "Block sender" "Refusing to block your own address."; exit 1; }
-[ -x "$ENGINE" ] || { notify "Block sender" "Gmail Nuker engine not found."; exit 1; }
+[ "$configured" = 1 ] || fail "Gmail Nuker is not configured. Open the app Settings."
+[ "$addr" != "$(printf '%s' "$mailbox" | tr 'A-Z' 'a-z')" ] || fail "Refusing to block your own address."
+[ -x "$ENGINE" ] || fail "Gmail Nuker engine not found."
 
 extra=()
 [ -z "$op_dir" ] || extra=("OP_CONFIG_DIR=${op_dir/#\~/$HOME}")
@@ -58,11 +63,12 @@ out="$(env GMAIL_NUKER_MAILBOX="$mailbox" GMAIL_NUKER_SECRET_REFERENCE="$ref" GM
   GMAIL_NUKER_CREDENTIAL_SOURCE="$source" ${extra[@]+"${extra[@]}"} \
   "$ENGINE" block "$addr" --exact --commit --purge --json 2>&1)"
 if printf '%s' "$out" | /usr/bin/grep -q '"success": *true'; then
+  moved="$(printf '%s' "$out" | /usr/bin/sed -n 's/.*"purged": *\([0-9]*\).*/\1/p' | tail -1)"
   notify "Blocked" "$addr"
-  echo "blocked $addr"
+  echo "blocked $addr ${moved:-0}"
 else
   msg="$(printf '%s' "$out" | /usr/bin/sed -n 's/.*"error": *"\([^"]*\)".*/\1/p' | head -1)"
   notify "Block failed" "${msg:-See engine output.}"
-  echo "failed $addr: ${msg:-$out}" >&2
+  echo "${msg:-The block did not finish. Check Settings and try again.}" >&2
   exit 1
 fi

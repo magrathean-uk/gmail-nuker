@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- App: the Mail block command now always gives feedback. The menu bar icon shows an hourglass while it runs, and the app posts its own notification on start, success (address and how many messages went to Trash) and failure (what to do). If notifications are off for the app, results show in an alert. Previously results went through `osascript` notifications, which macOS can drop silently.
 - App: three sections (Block, Offender list, Blocked). Blocking now covers the whole matching history (up to 5,000 messages) and the confirmation states the real total. The Offender list scans the last 30 days of inbox, blocks several selected senders exactly and deletes after one combined confirmation. The Blocked list searches the tool's filters and unblocks one (mail is never restored).
 - App: menu bar icon, open at login (first launch enables it; Settings toggles it), the Dock icon only while a window is open, and a built-in Mail command (Control-Option-Command-B or menu item) that blocks the selected sender and trashes their existing mail via the bundled script. Adds `NSAppleEventsUsageDescription`.
 

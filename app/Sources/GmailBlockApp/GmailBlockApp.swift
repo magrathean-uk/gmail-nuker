@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let launchedAtLogin = Self.wasLaunchedAsLoginItem()
         LoginItem.shared.configureOnFirstLaunch()
         MailBlocker.registerHotKey()
+        Notifier.shared.prepare()
         let center = NotificationCenter.default
         center.addObserver(self, selector: #selector(windowsChanged(_:)), name: NSWindow.willCloseNotification, object: nil)
         center.addObserver(self, selector: #selector(windowsChanged(_:)), name: NSWindow.didBecomeMainNotification, object: nil)
@@ -73,8 +74,11 @@ struct GmailBlockApp: App {
             }
         }
         Settings { AccountSettingsView(viewModel: viewModel) }
-        MenuBarExtra("Gmail Nuker", systemImage: "envelope.badge.shield.half.filled") {
+        MenuBarExtra {
             MenuContent(viewModel: viewModel)
+        } label: {
+            // Hourglass while a Mail block is running, so a click always shows it was received.
+            Image(systemName: MailState.shared.running ? "hourglass" : "envelope.badge.shield.half.filled")
         }
     }
 }
@@ -86,8 +90,9 @@ struct MenuContent: View {
 
     var body: some View {
         Button("Open Gmail Nuker") { show(nil) }
-        Button("Block Sender of Selected Mail Message") { MailBlocker.blockSelected() }
+        Button(MailState.shared.running ? "Blocking Sender…" : "Block Sender of Selected Mail Message") { MailBlocker.blockSelected() }
             .keyboardShortcut("b", modifiers: [.control, .option, .command])
+            .disabled(MailState.shared.running)
         Divider()
         Button("Offender List") { show(.offenders) }
         Button("Blocked Senders") { show(.blocked) }

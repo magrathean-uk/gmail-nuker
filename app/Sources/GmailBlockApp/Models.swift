@@ -85,3 +85,17 @@ public struct UnblockResult: Sendable, Codable, Equatable {
     public let unblock_verified: Bool?
     public let error: String?
 }
+
+/// Result of one Mail block, from block-sender.sh.
+struct MailBlockResult: Sendable, Equatable {
+    let address: String
+    let moved: Int
+
+    /// Parses block-sender.sh's success line: "blocked <address> <moved>".
+    static func parse(_ output: String) -> MailBlockResult? {
+        guard let line = output.split(whereSeparator: \.isNewline).last(where: { $0.hasPrefix("blocked ") }) else { return nil }
+        let parts = line.split(separator: " ")
+        guard parts.count >= 2 else { return nil }
+        return MailBlockResult(address: String(parts[1]), moved: parts.count >= 3 ? Int(parts[2]) ?? 0 : 0)
+    }
+}
